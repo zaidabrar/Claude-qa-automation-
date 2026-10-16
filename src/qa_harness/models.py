@@ -89,7 +89,7 @@ class GeneratedFile(BaseModel):
 
 class GenerationResult(BaseModel):
     files: list[GeneratedFile]
-    test_node_ids: list[str] = Field(description="pytest node ids for the new tests.")
+    test_node_ids: list[str] = Field(description="Scenario ids (feature:line) of the new scenarios.")
     summary: str
 
 
@@ -106,7 +106,9 @@ class Outcome(str, Enum):
 class TestResult(BaseModel):
     __test__ = False  # not a pytest class
 
-    node_id: str
+    node_id: str = Field(description="Scenario id: <feature path relative to the test project>:<line>.")
+    name: str = ""
+    tags: list[str] = Field(default_factory=list)
     device: str
     outcome: Outcome
     duration_s: float = 0.0

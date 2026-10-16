@@ -22,7 +22,9 @@ class AutonomyMode(str, Enum):
 
 class ProjectConfig(BaseModel):
     repo_root: Path = Path(".")
-    tests_dir: str = "mobile_tests"
+    tests_dir: str = "mobile-tests"  # the Maven project (Appium + TestNG + Cucumber)
+    maven_cmd: str = "mvn"
+    maven_args: list[str] = Field(default_factory=list)  # e.g. ["-s", "ci-settings.xml"]
     base_branch: str = "main"
     branch_prefix: str = "qa/"
     runs_dir: str = ".qa_runs"
@@ -57,7 +59,7 @@ class JiraConfig(BaseModel):
 
 
 class DeviceConfig(BaseModel):
-    name: str  # short id used in reports and pytest ids
+    name: str  # short id used in reports and Sauce build names
     platform: str  # android | ios
     device_name: str  # Sauce device name or regex, e.g. "Google Pixel.*"
     platform_version: str = ""

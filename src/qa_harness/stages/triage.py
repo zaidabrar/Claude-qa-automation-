@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings
+from ..framework import TestFramework
 from ..llm import LLM
 from ..models import BugReport, FailureVerdict, GenerationResult, TestPlan, TestResult, Ticket, TriageReport
 from ..prompts import load_prompt
@@ -41,8 +42,12 @@ def _log_excerpt(path: str | None) -> str:
     return "\n".join(picked[:200] + ["--- tail ---"] + lines[-80:])
 
 
-def _test_source(settings: Settings, node_id: str) -> str:
-    return _read(str(settings.repo_root / node_id.split("::")[0]), 20_000)
+def _feature_source(framework: TestFramework, node_id: str) -> str:
+    """The feature file with a marker on the failing scenario's line."""
+    path = framework.source_path(node_id)
+    text = _read(str(path), 20_000)
+    line = int(node_id.rsplit(":", 1)[1]) if node_id.rsplit(":", 1)[-1].isdigit() else -1
+    return "\n".join(f"{'>>' if n == line else '  '} {n:4d}  {t}" for n, t in enumerate(text.splitlines(), 1))
 
 
 def _failure_blocks(settings: Settings, failures: list[TestResult], memory: FlakeMemory) -> list[dict[str, Any]]:
@@ -81,6 +86,7 @@ def _failure_blocks(settings: Settings, failures: list[TestResult], memory: Flak
 def triage_failures(
     llm: LLM,
     settings: Settings,
+    framework: TestFramework,
     ticket: Ticket,
     plan: TestPlan,
     failures: list[TestResult],
@@ -96,8 +102,9 @@ def triage_failures(
     for node_id, results in by_test.items():
         header = (
             f"Ticket {ticket.key}: {ticket.summary}\n\nAcceptance criteria:\n{ticket.acceptance_criteria or '(none)'}"
-            f"\n\nTest plan cases:\n{_plan_digest(plan)}\n\n## Test source ({node_id.split('::')[0]})\n"
-            f"```python\n{_test_source(settings, node_id)}\n```\n\n"
+            f"\n\nTest plan cases:\n{_plan_digest(plan)}\n\n"
+            f"## Scenario {results[0].name or node_id} ({node_id}, marked >>)\n"
+            f"```gherkin\n{_feature_source(framework, node_id)}\n```\n\n"
             f"Devices that ran this test: {', '.join(sorted({r.device for r in results}))}"
         )
         content = [{"type": "text", "text": header}, *_failure_blocks(settings, results, memory)]
@@ -117,6 +124,7 @@ def _plan_digest(plan: TestPlan) -> str:
 def heal_tests(
     llm: LLM,
     settings: Settings,
+    framework: TestFramework,
     ws: Workspace,
     verdicts: list[FailureVerdict],
     failures: list[TestResult],
@@ -144,7 +152,7 @@ def heal_tests(
     outcome = llm.run_agent(
         system=load_prompt("healer"),
         task=task,
-        tools=build_workspace_tools(ws),
+        tools=build_workspace_tools(ws, framework),
         result_model=GenerationResult,
         max_turns=max(20, settings.llm.max_agent_turns // 2),
     )

@@ -15,7 +15,18 @@ from qa_harness.models import BugReport, FailureCategory, Outcome, TestPlan, Tic
 from qa_harness.pipeline import Deps, Pipeline, new_state
 from qa_harness.state import Guard, RunStore
 
-from .fakes import BUG, NODE, TEST_FILE, ScriptedExecutor, ScriptedLLM, make_plan, triage, verdict, write_test_via_tools
+from .fakes import (
+    BUG,
+    NODE,
+    TEST_FILE,
+    FakeFramework,
+    ScriptedExecutor,
+    ScriptedLLM,
+    make_plan,
+    triage,
+    verdict,
+    write_test_via_tools,
+)
 
 DEVICES = [
     DeviceConfig(name="pixel", platform="android", device_name="Google Pixel 8"),
@@ -67,6 +78,7 @@ def build(repo, llm, executor, mode=AutonomyMode.autonomous):
         settings=settings,
         secrets=Secrets(),
         llm=llm,
+        framework=FakeFramework(repo / "mobile-tests", repo),
         executor=executor,
         load_ticket=lambda key: TICKET,
         jira=JiraClient(settings.jira, "e", "t", transport=httpx.MockTransport(rec)),
@@ -111,7 +123,7 @@ def test_happy_path_jira_to_pr(sandbox_repo):
 def test_self_heals_test_defect_then_passes(sandbox_repo):
     def heal(tools):
         out, err = tools.execute(
-            "edit_file", {"path": TEST_FILE, "old_str": "assert True", "new_str": "assert True  # healed"}
+            "edit_file", {"path": TEST_FILE, "old_str": "Given the login screen", "new_str": "Given the healed screen"}
         )
         assert not err, out
         return _heal_result()
@@ -125,7 +137,7 @@ def test_self_heals_test_defect_then_passes(sandbox_repo):
 
     assert state.status == "passed"
     assert executor.calls[1] == {"pixel": [NODE]}  # only the affected device is re-run
-    assert "# healed" in (sandbox_repo / TEST_FILE).read_text()
+    assert "healed screen" in (sandbox_repo / TEST_FILE).read_text()
     assert not any(p.endswith("/rest/api/3/issue") for _, p in rec.writes())  # no bug filed
 
 
@@ -228,7 +240,7 @@ def test_resume_continues_from_checkpoint(sandbox_repo):
 
 
 def test_refuses_to_clobber_uncommitted_tests(sandbox_repo):
-    (sandbox_repo / "mobile_tests" / "tests" / "wip.py").write_text("# local work\n")
+    (sandbox_repo / "mobile-tests" / "src" / "test" / "Wip.java").write_text("// local work\n")
     llm = ScriptedLLM().queue(TestPlan, make_plan())
     pipe, _, _ = build(sandbox_repo, llm, ScriptedExecutor(DEVICES, [{}]))
     with pytest.raises(RuntimeError, match="uncommitted"):
@@ -248,7 +260,7 @@ def test_persistent_environment_failure_needs_human(sandbox_repo):
 
 def test_heal_that_breaks_collection_reruns_old_ids(sandbox_repo):
     def break_file(tools):
-        tools.execute("write_file", {"path": TEST_FILE, "content": "import nonexistent_module\n"})
+        tools.execute("write_file", {"path": TEST_FILE, "content": "BROKEN\n"})
         return _heal_result()
 
     llm = ScriptedLLM().queue(TestPlan, make_plan())

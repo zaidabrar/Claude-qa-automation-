@@ -6,6 +6,7 @@ qa-harness watch                       # autonomous: poll Jira for ready tickets
 qa-harness resume APP-123-20261016T...  # continue a crashed / budget-stopped run
 qa-harness plan APP-123                # print the test plan only
 qa-harness doctor                      # verify configuration and credentials
+qa-harness mcp                         # MCP server for GitHub Copilot agent mode
 """
 
 from __future__ import annotations
@@ -14,11 +15,13 @@ import argparse
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
 
 from .config import AutonomyMode, Secrets, Settings, load_settings
+from .framework import CucumberMaven
 from .integrations.github import Git, GitHubClient
 from .integrations.jira import JiraClient
 from .integrations.saucelabs import SauceClient
@@ -32,6 +35,12 @@ from .state import Guard, RunState, RunStore
 log = logging.getLogger("qa_harness")
 
 EXIT = {"passed": 0, "product_bug": 2, "needs_human": 3, "failed": 4, "error": 1}
+
+
+def build_framework(settings: Settings) -> CucumberMaven:
+    return CucumberMaven(
+        settings.tests_root, settings.repo_root, settings.project.maven_cmd, settings.project.maven_args
+    )
 
 
 def build_deps(settings: Settings, ticket_file: str | None = None) -> Deps:
@@ -60,12 +69,13 @@ def build_deps(settings: Settings, ticket_file: str | None = None) -> Deps:
     else:
         raise SystemExit("Jira is not configured (jira.base_url, JIRA_EMAIL, JIRA_API_TOKEN); pass --ticket-file")
 
-    store_root = settings.runs_root
-    executor = SauceExecutor(settings, secrets, sauce, store_root / "_artifacts")
+    framework = build_framework(settings)
+    executor = SauceExecutor(settings, secrets, sauce, framework, settings.runs_root / "_artifacts")
     return Deps(
         settings=settings,
         secrets=secrets,
         llm=LLM(settings.llm),
+        framework=framework,
         executor=executor,
         load_ticket=load_ticket,
         jira=jira,
@@ -200,7 +210,9 @@ def cmd_doctor(args, settings: Settings) -> int:
         "set sauce.android_app and/or sauce.ios_app",
     )
     check("GitHub token", bool(secrets.github_token), "GITHUB_TOKEN (contents + pull_requests write)")
-    check("Tests directory", settings.tests_root.is_dir(), f"{settings.tests_root} not found")
+    check("Test project", (settings.tests_root / "pom.xml").is_file(), f"no pom.xml in {settings.tests_root}")
+    check("Maven", shutil.which(settings.project.maven_cmd) is not None, "install Maven 3.9+ and a JDK 17+")
+    check("JDK", shutil.which("java") is not None, "install a JDK 17+")
     check("Git repository", (settings.repo_root / ".git").exists(), "repo_root is not a git checkout")
 
     if settings.jira.base_url and secrets.jira_email and secrets.jira_token:
@@ -222,6 +234,13 @@ def cmd_doctor(args, settings: Settings) -> int:
         f"(effort {settings.llm.effort}) · budget ${settings.llm.max_usd_per_run}/run"
     )
     return 0 if ok else 1
+
+
+def cmd_mcp(args, settings: Settings) -> int:
+    from .mcp_server import serve
+
+    serve(settings)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -261,6 +280,9 @@ def main(argv: list[str] | None = None) -> int:
 
     d = sub.add_parser("doctor", help="check configuration and connectivity")
     d.set_defaults(fn=cmd_doctor)
+
+    m = sub.add_parser("mcp", help="serve harness tools over MCP (stdio) for GitHub Copilot agent mode")
+    m.set_defaults(fn=cmd_mcp)
 
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")

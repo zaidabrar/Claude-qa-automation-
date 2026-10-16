@@ -1,0 +1,36 @@
+# Prepares the environment for GitHub Copilot coding agent: JDK + Maven dependencies for
+# mobile-tests/, and the qa-harness CLI/MCP server so Copilot can dry-run scenarios and
+# run them on Sauce Labs. Configure the MCP server under Settings -> Copilot -> Coding agent
+# (see docs/copilot.md).
+name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+  pull_request:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+
+jobs:
+  copilot-setup-steps: # this job name is required by Copilot
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: mobile-tests/pom.xml
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install qa-harness with the MCP server
+        run: pip install -e '.[mcp]'
+      - name: Pre-fetch Maven dependencies and compile
+        working-directory: mobile-tests
+        run: mvn -B -q test-compile
+      - name: Default harness config
+        run: test -f qa_harness.yaml || cp qa_harness.example.yaml qa_harness.yaml

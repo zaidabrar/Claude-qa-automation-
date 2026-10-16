@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import DeviceConfig, Secrets, Settings
+from .framework import TestFramework
 from .integrations import notify
 from .integrations.github import Git, GitHubClient
 from .integrations.jira import JiraClient
 from .llm import LLM
 from .models import FailureCategory, Outcome, RunSummary, Ticket
-from .stages.generator import generate_tests, ticket_slug, verify_collection
+from .stages.generator import generate_tests, ticket_slug
 from .stages.planner import build_plan
 from .stages.reporter import final_results, latest_verdicts, render_report
 from .stages.triage import draft_bug, heal_tests, triage_failures
@@ -42,6 +43,7 @@ class Deps:
     settings: Settings
     secrets: Secrets
     llm: LLM
+    framework: TestFramework
     executor: Executor
     load_ticket: Callable[[str], Ticket]
     jira: JiraClient | None = None
@@ -107,11 +109,11 @@ class Pipeline:
     def _stage_generate(self) -> None:
         assert self.state.plan and self.state.ticket
         self._prepare_branch()
-        gen = generate_tests(self.d.llm, self.state.plan, self.s, self.ws)
+        gen = generate_tests(self.d.llm, self.state.plan, self.s, self.ws, self.d.framework)
         self.state.generation = gen
         self.state.files_changed = sorted({f.path for f in gen.files} | self.ws.written)
         if not self._node_ids():
-            raise RuntimeError("Generated tests could not be collected by pytest; see audit.jsonl")
+            raise RuntimeError("Generated scenarios could not be discovered (compile/Cucumber error); see audit.jsonl")
 
     def _stage_execute(self) -> None:
         st, auto = self.state, self.s.autonomy
@@ -134,7 +136,7 @@ class Pipeline:
             if not failures:
                 break
 
-            report = triage_failures(self.d.llm, self.s, st.ticket, st.plan, failures, self.memory)
+            report = triage_failures(self.d.llm, self.s, self.d.framework, st.ticket, st.plan, failures, self.memory)
             st.triage.append(report)
             self._checkpoint()
             verdict = {(v.node_id, v.device): v for v in report.verdicts}
@@ -154,9 +156,8 @@ class Pipeline:
 
             if defects and heals < auto.max_heal_attempts:
                 heals += 1
-                healed = heal_tests(
-                    self.d.llm, self.s, self.ws, [verdict[(r.node_id, r.device)] for r in defects], defects
-                )
+                defect_verdicts = [verdict[(r.node_id, r.device)] for r in defects]
+                healed = heal_tests(self.d.llm, self.s, self.d.framework, self.ws, defect_verdicts, defects)
                 self.state.files_changed = sorted(
                     set(st.files_changed) | {f.path for f in healed.files} | self.ws.written
                 )
@@ -199,21 +200,26 @@ class Pipeline:
 
     # ------------------------------------------------------------------ helpers
 
-    def _test_files(self) -> list[str]:
-        tests_prefix = f"{self.s.project.tests_dir}/tests/"
-        return [
-            f
-            for f in self.state.files_changed
-            if f.startswith(tests_prefix) and Path(f).name.startswith("test_") and f.endswith(".py")
-        ]
+    def _feature_files(self) -> list[str]:
+        """Feature files this run created or changed, relative to the Maven project."""
+        out = []
+        for f in self.state.files_changed:
+            if f.endswith(".feature"):
+                rel = self.d.framework.to_project_path(f)
+                if rel:
+                    out.append(rel)
+        return out
 
     def _node_ids(self) -> list[str]:
-        files = self._test_files()
-        if not files:
+        features = self._feature_files()
+        if not features:
             return []
-        collected, output = verify_collection(self.s, files)
-        self.store.event("collect", {"files": files, "collected": len(collected), "output": output[-3000:]})
-        return collected
+        found = self.d.framework.discover(features)
+        self.store.event(
+            "discover",
+            {"features": features, "scenarios": len(found.ids), "problems": found.problems, "compiled": found.compiled},
+        )
+        return found.ids
 
     def _prepare_branch(self) -> None:
         git, st = self.d.git, self.state

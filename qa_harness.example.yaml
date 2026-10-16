@@ -3,7 +3,9 @@
 
 project:
   repo_root: .              # repo containing the Appium suite (relative to this file)
-  tests_dir: mobile_tests
+  tests_dir: mobile-tests    # Maven project: Appium (Java) + TestNG + Cucumber
+  maven_cmd: mvn
+  maven_args: []            # e.g. ["-s", ".mvn/ci-settings.xml"] for a private Nexus/Artifactory
   base_branch: main
   branch_prefix: qa/
 

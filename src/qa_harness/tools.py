@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import fnmatch
 import re
-import subprocess
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,11 +16,14 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .framework import TestFramework
+
 MAX_READ_BYTES = 200_000
 MAX_OUTPUT_CHARS = 30_000
 
 DENY_READ = [".git/*", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.keystore", "*.jks", "*secrets*"]
-SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache", "target", ".idea"}
+WRITABLE_SUFFIXES = {".java", ".feature", ".properties", ".json", ".csv", ".md", ".txt"}
 
 
 class ToolFailure(Exception):
@@ -113,14 +114,14 @@ class EditFileInput(BaseModel):
 class SearchInput(BaseModel):
     pattern: str = Field(description="Python regular expression.")
     path: str = Field(".", description="Directory to search, relative to the repo root.")
-    glob: str = Field("*.py", description="Filename glob filter.")
+    glob: str = Field("*.java", description="Filename glob filter, e.g. *.java or *.feature.")
     max_results: int = Field(80, ge=1, le=500)
 
 
-class PytestInput(BaseModel):
-    targets: list[str] = Field(
+class DryRunInput(BaseModel):
+    features: list[str] = Field(
         default_factory=list,
-        description="Test files or node ids to collect. Defaults to the whole tests directory.",
+        description="Feature files (repo-relative) to dry-run. Empty = the whole suite.",
     )
 
 
@@ -154,11 +155,13 @@ class Workspace:
     def check_writable(self, p: Path) -> None:
         if p != self.writable and self.writable not in p.parents:
             raise ToolFailure(f"Writes are only allowed under {self.rel(self.writable)}/")
-        if p.suffix not in {".py", ".json", ".yaml", ".yml", ".md", ".txt", ".ini", ".cfg"}:
+        if p.suffix == ".xml" or p.name in {"pom.xml", "build.gradle", "testng.xml"}:
+            raise ToolFailure("Build files are not editable by the agent; dependency changes need a human")
+        if p.suffix not in WRITABLE_SUFFIXES:
             raise ToolFailure(f"Refusing to write file type {p.suffix!r}")
 
 
-def build_workspace_tools(ws: Workspace, *, allow_write: bool = True) -> ToolRegistry:
+def build_workspace_tools(ws: Workspace, framework: TestFramework, *, allow_write: bool = True) -> ToolRegistry:
     reg = ToolRegistry()
 
     @reg.add("list_dir", "List files and directories (tree view) under a path.", ListDirInput)
@@ -220,17 +223,28 @@ def build_workspace_tools(ws: Workspace, *, allow_write: bool = True) -> ToolReg
         return "\n".join(hits) or "No matches"
 
     @reg.add(
-        "collect_tests",
-        "Run `pytest --collect-only` on the tests directory to verify the suite imports and is discoverable. "
-        "No device is used.",
-        PytestInput,
+        "compile",
+        "Compile the test suite (mvn test-compile). Returns compiler errors with file:line.",
+        EmptyInput,
     )
-    def collect_tests(inp: PytestInput) -> str:
-        return run_pytest_collect(ws.root, ws.writable, inp.targets)
+    def compile_(_: EmptyInput) -> str:
+        ok, out = framework.compile()
+        return ("BUILD SUCCESS" if ok else "BUILD FAILED") + "\n" + out
 
-    @reg.add("lint", "Run ruff (or py_compile if ruff is missing) on the tests directory.", EmptyInput)
-    def lint(_: EmptyInput) -> str:
-        return run_lint(ws.root, ws.writable)
+    @reg.add(
+        "cucumber_dry_run",
+        "Compile, then run Cucumber in dry-run mode: lists every scenario id (feature:line) and reports "
+        "undefined or ambiguous steps. No device is used.",
+        DryRunInput,
+    )
+    def dry_run(inp: DryRunInput) -> str:
+        features = []
+        for f in inp.features:
+            rel = framework.to_project_path(f)
+            if rel is None:
+                raise ToolFailure(f"{f} is not inside the test project")
+            features.append(rel)
+        return framework.discover(features or None).summary()
 
     if not allow_write:
         return reg
@@ -267,41 +281,3 @@ def build_workspace_tools(ws: Workspace, *, allow_write: bool = True) -> ToolReg
         return f"Edited {ws.rel(p)}"
 
     return reg
-
-
-# ---------------------------------------------------------------------- checks
-
-
-def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> tuple[int, str]:
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    return proc.returncode, (proc.stdout + proc.stderr).strip()
-
-
-def run_pytest_collect(repo_root: Path, tests_dir: Path, targets: list[str] | None = None) -> str:
-    # Targets only, never flags: the model must not be able to load plugins or change config.
-    safe = [t for t in (targets or []) if not t.startswith("-")] or [str(tests_dir)]
-    code, out = _run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-o",
-            "addopts=",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            "-m",
-            "not example",
-            *safe,
-        ],
-        repo_root,
-    )
-    return f"exit={code}\n{out[-8000:]}"
-
-
-def run_lint(repo_root: Path, tests_dir: Path) -> str:
-    code, out = _run([sys.executable, "-m", "ruff", "check", str(tests_dir)], repo_root)
-    if "No module named ruff" in out:
-        code, out = _run([sys.executable, "-m", "compileall", "-q", str(tests_dir)], repo_root)
-    return f"exit={code}\n{out[-8000:] or 'clean'}"

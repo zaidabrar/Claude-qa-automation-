@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "qa-harness": {
+      "type": "stdio",
+      "command": "qa-harness",
+      "args": ["--config", "${workspaceFolder}/qa_harness.yaml", "mcp"],
+      "envFile": "${workspaceFolder}/.env"
+    }
+  }
+}

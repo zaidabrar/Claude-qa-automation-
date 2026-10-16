@@ -44,7 +44,7 @@ def matrix_table(state: RunState) -> str:
     for r in results:
         grid[r.node_id][r.device] = r
     lines = ["| Test | " + " | ".join(devices) + " |", "|---|" + "---|" * len(devices)]
-    for node_id, row in grid.items():
+    for row in grid.values():
         cells = []
         for d in devices:
             r = row.get(d)
@@ -54,8 +54,14 @@ def matrix_table(state: RunState) -> str:
                 cells.append(f"[{ICON[r.outcome]}]({r.sauce_url})")
             else:
                 cells.append(ICON[r.outcome])
-        lines.append(f"| `{node_id.split('::')[-1]}` | " + " | ".join(cells) + " |")
+        lines.append(f"| {_label(row)} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
+
+
+def _label(row: dict[str, TestResult]) -> str:
+    r = next(iter(row.values()))
+    file_line = r.node_id.rsplit("/", 1)[-1]
+    return f"{r.name} <sub>`{file_line}`</sub>" if r.name else f"`{file_line}`"
 
 
 def render_report(state: RunState, *, for_jira: bool = False) -> str:
@@ -93,10 +99,11 @@ def render_report(state: RunState, *, for_jira: bool = False) -> str:
         and any(r.node_id == v.node_id and r.device == v.device and r.outcome != Outcome.passed for r in results)
     ]
     if unresolved:
+        names = {r.node_id: r.name or r.node_id for r in results}
         out += ["", "### Open findings"]
         for v in unresolved:
             out.append(
-                f"- **{v.category.value}** `{v.node_id.split('::')[-1]}` on {v.device} "
+                f"- **{v.category.value}** {names.get(v.node_id, v.node_id)} on {v.device} "
                 f"({v.confidence:.0%}): {v.root_cause}"
             )
     healed = sum(1 for v in verdicts if v.category == FailureCategory.test_defect)

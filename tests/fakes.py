@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from qa_harness.config import DeviceConfig, LLMConfig
+from qa_harness.framework import CucumberMaven, Discovery
 from qa_harness.llm import LLM, AgentOutcome
 from qa_harness.models import (
     BugReport,
@@ -53,25 +54,46 @@ def make_plan(key: str = "APP-1") -> TestPlan:
     )
 
 
-TEST_FILE = "mobile_tests/tests/test_app_1_login.py"
-TEST_SOURCE = """import pytest
+TEST_FILE = "mobile-tests/src/test/resources/features/app_1/login.feature"
+TEST_SOURCE = """@APP-1
+Feature: Login errors
 
-
-@pytest.mark.ticket("APP-1")
-@pytest.mark.case("TC-01")
-@pytest.mark.priority(1)
-def test_wrong_password_shows_error():
-    assert True
+  @TC-01 @P1
+  Scenario: Wrong password shows error
+    Given the login screen is displayed
 """
-NODE = f"{TEST_FILE}::test_wrong_password_shows_error"
+NODE = "src/test/resources/features/app_1/login.feature:5"
 
 
 def write_test_via_tools(tools: ToolRegistry) -> GenerationResult:
     out, err = tools.execute("write_file", {"path": TEST_FILE, "content": TEST_SOURCE})
     assert not err, out
     return GenerationResult(
-        files=[GeneratedFile(path=TEST_FILE, purpose="tests")], test_node_ids=[NODE], summary="1 test"
+        files=[GeneratedFile(path=TEST_FILE, purpose="feature")], test_node_ids=[NODE], summary="1 scenario"
     )
+
+
+class FakeFramework(CucumberMaven):
+    """Real path handling; compile/discover simulated by scanning feature files (no Maven needed).
+
+    Any file under the project containing BROKEN makes compilation fail."""
+
+    def compile(self) -> tuple[bool, str]:
+        for f in self.project_dir.rglob("*"):
+            if f.is_file() and f.suffix in (".java", ".feature") and "BROKEN" in f.read_text():
+                return False, f"compilation error in {f.name}"
+        return True, "compiled"
+
+    def discover(self, features=None) -> Discovery:
+        ok, out = self.compile()
+        if not ok:
+            return Discovery(compiled=False, output=out)
+        ids = []
+        for rel in features or []:
+            for n, line in enumerate((self.project_dir / rel).read_text().splitlines(), 1):
+                if line.strip().startswith(("Scenario:", "Scenario Outline:")):
+                    ids.append(f"{rel}:{n}")
+        return Discovery(ids=ids)
 
 
 def verdict(category: FailureCategory, device: str = "pixel", confidence: float = 0.9) -> FailureVerdict:

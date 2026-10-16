@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qa-harness"
 version = "0.1.0"
-description = "Autonomous AI QA harness for mobile apps: Jira ticket -> Appium tests -> Sauce Labs validation -> pull request."
+description = "Autonomous AI QA harness for mobile apps: Jira ticket -> Appium Java/TestNG/Cucumber tests -> Sauce Labs -> pull request."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,13 +16,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mobile = [
-    "Appium-Python-Client>=4.0",
-    "pytest>=8.0",
+# MCP server for GitHub Copilot agent mode / Copilot coding agent (`qa-harness mcp`).
+mcp = [
+    "mcp>=2.2",
 ]
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
+    "mcp>=2.2",
 ]
 
 [project.scripts]

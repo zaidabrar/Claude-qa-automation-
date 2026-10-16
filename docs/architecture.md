@@ -15,8 +15,8 @@ reproducible, resumable, and auditable.
   truncated by `max_tokens` is never executed, and a declined request (`refusal`) raises rather than being read
   as output.
 
-**Trust evidence over claims.** After generation, the harness trusts the files actually written and the node ids
-pytest actually collects, not the model's own report. During triage, the page source captured on the device is
+**Trust evidence over claims.** After generation, the harness trusts the files actually written and the scenario
+ids a Cucumber dry run actually discovers, not the model's own report. During triage, the page source captured on the device is
 the primary evidence. During healing, locators must come from attributes present in that XML.
 
 **Fail closed.** If a requested test produces no result (import error, crash, timeout), it is recorded as an
@@ -49,7 +49,7 @@ Final status is:
   plan.json       the test plan
   report.md       the final report (also the PR body)
   artifacts/attempt<N>/<device>/
-    pytest.log, junit.xml, results.json
+    run.log, surefire-reports/, results.json
     evidence/<test>/screenshot.png, page_source.xml
     sauce/<job_id>/device_log.log, appium_log.log, ...
 .qa_runs/flake_memory.json   per test@device outcome history across runs
@@ -57,20 +57,22 @@ Final status is:
 
 ## Contract between the harness and the suite
 
-The harness runs `pytest` once per device and describes the device in environment variables. Any suite that
-honours this contract works:
+The harness compiles the Maven project once, then runs `mvn surefire:test -Dcucumber.features=<feature:line,...>`
+once per device (concurrently), describing the device in environment variables. Scenario ids are
+`<feature path relative to mobile-tests>:<line>`. Any suite that honours this contract works:
 
 | Variable | Meaning |
 |---|---|
 | `QA_DEVICE` | JSON `DeviceConfig` (name, platform, device_name, platform_version, extra_capabilities) |
 | `QA_APP_ANDROID` / `QA_APP_IOS` | Appium `app` capability (`storage:...`) |
 | `QA_BUILD` | Sauce build name, so all devices of a run group together |
-| `QA_RESULTS_FILE` | where to write the JSON results list (`TestResult` fields) |
+| `QA_RESULTS_FILE` | where to write the JSON results list (`TestResult` fields; written by `QaResultsPlugin`) |
 | `QA_ARTIFACTS_DIR` | where to save screenshots and page source on failure |
 | `SAUCE_REGION`, `SAUCE_USERNAME`, `SAUCE_ACCESS_KEY`, `SAUCE_TUNNEL_NAME` | Sauce session settings |
 | `APPIUM_URL` | bypasses Sauce and targets a local Appium server, for debugging |
 
-`mobile_tests/conftest.py` implements the contract for Appium-Python-Client.
+`QaResultsPlugin`, `Hooks`, `DriverFactory`, and `DeviceConfig` in `mobile-tests/` implement it for Appium Java +
+Cucumber. Another stack (Gradle, JUnit 5, WebdriverIO) needs a new `TestFramework` adapter in `framework.py`.
 
 ## Extension points
 
@@ -78,7 +80,7 @@ honours this contract works:
   (`devices()`, `run(targets, attempt, build)`) and swap it into `Deps`.
 - **Another tracker** (Linear, Azure Boards): provide a `load_ticket` callable, and an object with
   `comment/transition/add_label/create_bug/attach/link`.
-- **Web or API tests:** change `tests_dir`, `CONVENTIONS.md`, and the generator and healer prompts, and keep
+- **Web or API tests:** change `tests_dir`, the `.github/instructions/` files, and the generator and healer prompts, and keep
   the pipeline.
 - **More autonomy controls:** every external write goes through `Guard.run(action, detail, fn)`, so a new policy
   (Slack approval, an allow-list of projects) is a change in one class.

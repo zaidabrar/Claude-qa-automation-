@@ -15,13 +15,13 @@ def _git(cwd: Path, *args: str) -> str:
 
 @pytest.fixture
 def sandbox_repo(tmp_path: Path) -> Path:
-    """A throwaway git repo containing the real mobile_tests scaffold and a bare 'origin' remote."""
+    """A throwaway git repo containing the real mobile-tests Maven project and a bare 'origin' remote."""
     origin = tmp_path / "origin.git"
     repo = tmp_path / "repo"
     _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
     repo.mkdir()
-    shutil.copytree(REPO / "mobile_tests", repo / "mobile_tests", ignore=shutil.ignore_patterns("__pycache__"))
-    (repo / ".gitignore").write_text(".qa_runs/\n__pycache__/\n")
+    shutil.copytree(REPO / "mobile-tests", repo / "mobile-tests", ignore=shutil.ignore_patterns("target"))
+    (repo / ".gitignore").write_text(".qa_runs/\ntarget/\n")
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "config", "user.email", "qa@example.com")
     _git(repo, "config", "user.name", "QA Bot")

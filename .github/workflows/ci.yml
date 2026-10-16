@@ -6,16 +6,39 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  harness:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e '.[dev,mobile]'
-      - run: ruff check src tests mobile_tests
-      - run: ruff format --check src tests mobile_tests
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: mobile-tests/pom.xml
+      - run: pip install -e '.[dev]'
+      - run: ruff check src tests
+      - run: ruff format --check src tests
       - run: pytest tests
-      # The mobile suite must always import and collect, even without a device.
-      - run: pytest mobile_tests --collect-only -q -o addopts=
+
+  mobile-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: mobile-tests/pom.xml
+      # Compiles and binds every step of every scenario (examples included) without a device:
+      # catches undefined/ambiguous steps and compile errors on every PR.
+      - run: >-
+          mvn -B -q test-compile surefire:test -Dcucumber.execution.dry-run=true
+          -Dcucumber.filter.tags="@example or not @example"

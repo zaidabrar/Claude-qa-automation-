@@ -1,6 +1,6 @@
 """Sauce Labs REST client: app storage, job lookup, and evidence download.
 
-Test sessions themselves are started by the Appium suite (see mobile_tests/conftest.py);
+Test sessions themselves are started by the Appium suite (see mobile-tests/.../DriverFactory.java);
 this client handles everything around them.
 """
 

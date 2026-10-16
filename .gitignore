@@ -7,3 +7,4 @@ venv/
 .env
 .qa_runs/
 .qa_artifacts/
+target/

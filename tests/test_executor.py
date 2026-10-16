@@ -1,73 +1,155 @@
-"""Runs the real executor -> pytest -> mobile_tests/conftest.py contract, with a fake Appium driver."""
+"""Contract test: harness -> Maven/Surefire/TestNG/Cucumber -> QaResultsPlugin, on the real mobile-tests project.
+
+No device is used: the scenarios' steps never touch the driver, which the suite only starts on demand.
+Skipped when Maven/JDK are not installed.
+"""
+
+import shutil
+
+import pytest
 
 from qa_harness.config import DeviceConfig, Secrets, Settings
+from qa_harness.framework import CucumberMaven
 from qa_harness.models import Outcome
 from qa_harness.stages.executor import SauceExecutor
 
-SUITE = """import pytest
+pytestmark = pytest.mark.skipif(not (shutil.which("mvn") and shutil.which("java")), reason="needs Maven + JDK")
 
+FEATURE = "src/test/resources/features/app_1/contract.feature"
+FEATURE_TEXT = """@APP-1
+Feature: Contract
 
-class FakeDriver:
-    session_id = "sauce-job-123"
+  Scenario: passes
+    Given a step that passes
 
-    def save_screenshot(self, path):
-        open(path, "wb").write(b"\\x89PNG fake")
+  Scenario: fails
+    Given a step that fails
 
-    @property
-    def page_source(self):
-        return "<hierarchy><node content-desc='login-button'/></hierarchy>"
+  @ios
+  Scenario: ios only
+    Given a step that passes
+"""
+STEPS = """package com.qa.mobile.steps;
 
+import io.cucumber.java.en.Given;
 
-@pytest.fixture
-def fake_driver(request):
-    request.node._qa_driver = FakeDriver()
-    return request.node._qa_driver
+public class ContractSteps {
+  @Given("a step that passes")
+  public void passes() {}
 
-
-def test_passes(fake_driver):
-    assert True
-
-
-def test_fails(fake_driver):
-    assert False, "banner not found"
-
-
-@pytest.mark.platform("ios")
-def test_ios_only(fake_driver):
-    assert True
+  @Given("a step that fails")
+  public void fails() {
+    throw new AssertionError("banner not found");
+  }
+}
 """
 
 
-def test_executor_collects_results_and_evidence(sandbox_repo):
-    (sandbox_repo / "mobile_tests" / "tests" / "test_contract.py").write_text(SUITE)
+@pytest.fixture
+def project(sandbox_repo):
+    root = sandbox_repo / "mobile-tests"
+    (root / FEATURE).parent.mkdir(parents=True)
+    (root / FEATURE).write_text(FEATURE_TEXT)
+    (root / "src/test/java/com/qa/mobile/steps/ContractSteps.java").write_text(STEPS)
+    return sandbox_repo
+
+
+def test_discover_and_run_on_two_devices_concurrently(project):
     settings = Settings()
-    settings.project.repo_root = sandbox_repo
-    settings.sauce.devices = [DeviceConfig(name="pixel", platform="android", device_name="Pixel")]
-    ex = SauceExecutor(settings, Secrets(), sauce=None, artifacts_root=sandbox_repo / ".qa_runs" / "a")
+    settings.project.repo_root = project
+    settings.sauce.devices = [
+        DeviceConfig(name="pixel", platform="android", device_name="Pixel"),
+        DeviceConfig(name="galaxy", platform="android", device_name="Galaxy"),
+    ]
+    framework = CucumberMaven(settings.tests_root, project)
 
-    base = "mobile_tests/tests/test_contract.py::"
-    nodes = [base + n for n in ("test_passes", "test_fails", "test_ios_only")]
-    summary = ex.run({"pixel": nodes}, attempt=1, build="b")
+    found = framework.discover([FEATURE])
+    assert found.compiled, found.output
+    assert found.ids == [f"{FEATURE}:4", f"{FEATURE}:7", f"{FEATURE}:11"]
+    assert found.problems == {}
 
-    by_name = {r.node_id.split("::")[-1]: r for r in summary.results}
-    assert by_name["test_passes"].outcome == Outcome.passed
-    assert by_name["test_ios_only"].outcome == Outcome.skipped  # platform marker honoured
-    failed = by_name["test_fails"]
-    assert failed.outcome == Outcome.failed and "banner not found" in failed.message
-    assert failed.sauce_job_id == "sauce-job-123"
-    assert failed.sauce_url == "https://app.saucelabs.com/tests/sauce-job-123"
-    assert "login-button" in open(failed.artifacts["page_source"]).read()
-    assert open(failed.artifacts["screenshot"], "rb").read().startswith(b"\x89PNG")
-    assert summary.failures == [failed]
+    ex = SauceExecutor(settings, Secrets(), None, framework, project / ".qa_runs" / "a")
+    ids = [*found.ids, f"{FEATURE}:99"]  # a scenario that does not exist must not vanish
+    summary = ex.run({"pixel": ids, "galaxy": ids}, attempt=1, build="b")
+
+    for device in ("pixel", "galaxy"):
+        got = {r.node_id: r for r in summary.results if r.device == device}
+        assert got[f"{FEATURE}:4"].outcome == Outcome.passed
+        assert got[f"{FEATURE}:4"].name == "passes"
+        failed = got[f"{FEATURE}:7"]
+        assert failed.outcome == Outcome.failed
+        assert "Given a step that fails" in failed.message and "banner not found" in failed.message
+        assert "ContractSteps.fails" in failed.traceback
+        assert got[f"{FEATURE}:11"].outcome == Outcome.skipped  # @ios on an Android device
+        assert got[f"{FEATURE}:99"].outcome == Outcome.error
 
 
-def test_executor_reports_suite_crash_as_errors(sandbox_repo):
-    (sandbox_repo / "mobile_tests" / "tests" / "test_broken.py").write_text("import nonexistent_module\n")
+def test_discovery_reports_undefined_steps(project):
+    undefined = "\n  Scenario: undefined\n    Given nobody wrote me\n"
+    (project / "mobile-tests" / FEATURE).write_text(FEATURE_TEXT + undefined)
+    found = CucumberMaven(project / "mobile-tests", project).discover([FEATURE])
+    assert found.problems == {f"{FEATURE}:14": "UNDEFINED step: Given nobody wrote me (line 15)"}
+
+
+def test_compile_error_becomes_error_results(project):
+    (project / "mobile-tests/src/test/java/com/qa/mobile/steps/Broken.java").write_text("class Broken { oops }")
     settings = Settings()
-    settings.project.repo_root = sandbox_repo
+    settings.project.repo_root = project
     settings.sauce.devices = [DeviceConfig(name="pixel", platform="android", device_name="Pixel")]
-    ex = SauceExecutor(settings, Secrets(), sauce=None, artifacts_root=sandbox_repo / ".qa_runs" / "a")
-    node = "mobile_tests/tests/test_broken.py::test_x"
-    summary = ex.run({"pixel": [node]}, attempt=1, build="b")
+    framework = CucumberMaven(settings.tests_root, project)
+    assert framework.discover([FEATURE]).compiled is False
+    summary = SauceExecutor(settings, Secrets(), None, framework, project / ".qa_runs" / "a").run(
+        {"pixel": [f"{FEATURE}:4"]}, attempt=1, build="b"
+    )
     assert [r.outcome for r in summary.results] == [Outcome.error]
-    assert "nonexistent_module" in summary.results[0].traceback
+    assert "Broken.java" in summary.results[0].traceback
+
+
+def test_pipeline_discovers_generated_feature_with_real_maven(sandbox_repo):
+    """Generate stage -> real Maven compile + Cucumber dry run -> scenario ids handed to execution."""
+    from qa_harness.config import AutonomyMode
+    from qa_harness.models import GeneratedFile, GenerationResult, TestPlan, Ticket
+    from qa_harness.pipeline import Deps, Pipeline, new_state
+    from qa_harness.state import Guard, RunStore
+
+    from .fakes import ScriptedExecutor, ScriptedLLM, make_plan
+
+    feature = "mobile-tests/src/test/resources/features/app_1/login_errors.feature"
+
+    def generate(tools):
+        out, err = tools.execute(
+            "write_file",
+            {
+                "path": feature,
+                "content": "@APP-1\nFeature: Login errors\n\n  @TC-01 @P1\n  Scenario: Wrong password shows error\n"
+                "    Given the login screen is displayed\n"
+                '    When I log in as "u" with password "bad"\n'
+                '    Then I see a login error containing "invalid"\n',
+            },
+        )
+        assert not err, out
+        out, err = tools.execute("cucumber_dry_run", {"features": [feature]})
+        assert "0 with problems" in out, out
+        return GenerationResult(files=[GeneratedFile(path=feature, purpose="f")], test_node_ids=[], summary="s")
+
+    settings = Settings()
+    settings.project.repo_root = sandbox_repo
+    settings.sauce.devices = [DeviceConfig(name="pixel", platform="android", device_name="Pixel")]
+    settings.autonomy.mode = AutonomyMode.dry_run
+    llm = ScriptedLLM().queue(TestPlan, make_plan())
+    llm.agent_queue.append(generate)
+    executor = ScriptedExecutor(settings.sauce.devices, [{}])
+    deps = Deps(
+        settings=settings,
+        secrets=Secrets(),
+        llm=llm,
+        framework=CucumberMaven(settings.tests_root, sandbox_repo),
+        executor=executor,
+        load_ticket=lambda k: Ticket(key=k, summary="Login"),
+    )
+    state = new_state("APP-1")
+    store = RunStore(settings.runs_root, state.run_id)
+    result = Pipeline(deps, store, state, Guard(AutonomyMode.dry_run, store)).run()
+
+    assert result.status == "passed"
+    assert executor.calls == [{"pixel": ["src/test/resources/features/app_1/login_errors.feature:5"]}]
