@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev,mobile]'
+      - run: ruff check src tests mobile_tests
+      - run: ruff format --check src tests mobile_tests
+      - run: pytest tests
+      # The mobile suite must always import and collect, even without a device.
+      - run: pytest mobile_tests --collect-only -q -o addopts=

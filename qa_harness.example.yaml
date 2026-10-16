@@ -1,0 +1,73 @@
+# Copy to qa_harness.yaml and adjust. Secrets never go here; they come from the
+# environment (see .env.example).
+
+project:
+  repo_root: .              # repo containing the Appium suite (relative to this file)
+  tests_dir: mobile_tests
+  base_branch: main
+  branch_prefix: qa/
+
+llm:
+  model: claude-opus-5-5
+  effort: high              # planning + generation + healing; raise to xhigh for complex apps
+  triage_effort: high
+  max_usd_per_run: 20       # hard stop; the run checkpoints and can be resumed
+  fallbacks: true           # server-side fallback model if a request is declined
+
+jira:
+  base_url: https://your-company.atlassian.net
+  # Tickets the autonomous watcher picks up. Tickets already labelled done_label are skipped.
+  ready_jql: 'project = APP AND status = "Ready for QA" AND labels = "qa-ai" ORDER BY priority DESC'
+  acceptance_criteria_field: null   # e.g. customfield_10042 if AC lives in a custom field
+  transitions:
+    on_start: null                  # e.g. "In QA"
+    on_pass: "QA Passed"
+    on_fail: "QA Failed"
+  bug_project: null                 # defaults to the ticket's project
+  bug_issue_type: Bug
+  bug_labels: [qa-ai-found]
+  done_label: qa-ai-done
+
+sauce:
+  region: us-west-1                 # us-west-1 | eu-central-1 | us-east-4
+  # Local path (uploaded each run) or an existing storage reference.
+  android_app: storage:filename=MyApp.apk
+  ios_app: storage:filename=MyApp.ipa
+  appium_version: latest
+  max_parallel: 4                   # keep at or below your Sauce concurrency
+  test_timeout_s: 1800
+  devices:
+    - name: pixel8
+      platform: android
+      device_name: "Google Pixel 8.*"     # regex = any matching real device (faster allocation)
+      platform_version: "14"
+      real_device: true
+    - name: galaxy-s23
+      platform: android
+      device_name: "Samsung Galaxy S23.*"
+      real_device: true
+    - name: iphone15
+      platform: ios
+      device_name: "iPhone 15.*"
+      platform_version: "17"
+      real_device: true
+
+github:
+  repo: ""                          # owner/name; inferred from `git remote origin` when empty
+  draft_pr: true
+  reviewers: []
+  labels: [qa-automation, ai-generated]
+
+autonomy:
+  # autonomous: no prompts. supervised: confirm Jira writes / bugs / push / PR in the terminal.
+  # dry_run: everything runs locally (tests still execute on Sauce) but nothing is written to Jira/GitHub.
+  mode: autonomous
+  max_heal_attempts: 3
+  max_env_retries: 1
+  file_bugs: true
+  min_bug_confidence: 0.8           # only file bugs when triage is at least this sure
+  transition_jira: true
+  open_pr_on_product_bug: true
+
+notify:
+  slack_webhook_env: SLACK_WEBHOOK_URL
