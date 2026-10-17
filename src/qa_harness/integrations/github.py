@@ -16,11 +16,11 @@ class Git:
     def __init__(self, repo_root: Path):
         self.root = repo_root
 
-    def run(self, *args: str, check: bool = True) -> str:
+    def run(self, *args: str, check: bool = True, strip: bool = True) -> str:
         proc = subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True)
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}")
-        return proc.stdout.strip()
+        return proc.stdout.strip() if strip else proc.stdout
 
     def current_branch(self) -> str:
         return self.run("rev-parse", "--abbrev-ref", "HEAD")
@@ -28,13 +28,27 @@ class Git:
     def is_dirty(self, paths: list[str] | None = None) -> bool:
         return bool(self.run("status", "--porcelain", *(["--", *paths] if paths else [])))
 
-    def checkout_new(self, branch: str, base: str) -> None:
-        self.run("fetch", "origin", base, check=False)
-        start = f"origin/{base}" if self.run("rev-parse", "--verify", f"origin/{base}", check=False) else base
-        self.run("checkout", "-B", branch, start)
+    def create_branch(self, branch: str) -> None:
+        """Branch from the current HEAD, carrying uncommitted changes along (VS Code workflow)."""
+        if self.run("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False):
+            self.run("checkout", branch)
+        else:
+            self.run("checkout", "-b", branch)
+
+    def changed_files(self, path: str) -> list[str]:
+        """Modified, added and untracked files under ``path`` (repo-relative)."""
+        # Not stripped: porcelain lines start with a status column that may be a space.
+        out = self.run("status", "--porcelain", "--untracked-files=all", "--", path, strip=False)
+        files = []
+        for line in out.splitlines():
+            name = line[3:]
+            if " -> " in name:  # rename
+                name = name.split(" -> ", 1)[1]
+            files.append(name.strip('"'))
+        return files
 
     def commit(self, paths: list[str], message: str) -> str | None:
-        self.run("add", "--", *paths)
+        self.run("add", "-A", "--", *paths)
         if not self.run("diff", "--cached", "--name-only"):
             return None
         self.run("commit", "-m", message)

@@ -1,0 +1,75 @@
+# Hands-free QA without any LLM key: a Jira ticket becomes a GitHub issue assigned to the
+# Copilot coding agent, which runs the qa-engineer workflow (.github/agents/qa-engineer.agent.md)
+# with the qa-harness MCP tools and opens the PR.
+#
+# Triggers:
+#  - Jira Automation "Send web request" when a ticket moves to Ready for QA:
+#      POST https://api.github.com/repos/<owner>/<repo>/dispatches
+#      {"event_type": "qa-ticket", "client_payload": {"ticket": "{{issue.key}}"}}
+#  - Manual: Actions -> jira-to-copilot -> Run workflow
+#  - Schedule: sweep the jira.ready_jql queue
+name: jira-to-copilot
+
+on:
+  repository_dispatch:
+    types: [qa-ticket]
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: Jira key (empty = every ticket in jira.ready_jql)
+        required: false
+  schedule:
+    - cron: "23 */2 * * 1-5"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    env:
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      # Assigning the Copilot coding agent requires a user token (fine-grained PAT with Issues: write).
+      GH_TOKEN: ${{ secrets.QA_BOT_TOKEN || secrets.GITHUB_TOKEN }}
+      TICKET: ${{ github.event.client_payload.ticket || github.event.inputs.ticket }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - run: test -f qa_harness.yaml || cp qa_harness.example.yaml qa_harness.yaml
+      - name: Pick tickets
+        id: pick
+        run: |
+          if [ -n "$TICKET" ]; then echo "keys=$TICKET" >> "$GITHUB_OUTPUT"; exit 0; fi
+          keys=$(qa-harness ready --limit 5 | sed -n 's/^- \([A-Z][A-Z0-9]*-[0-9]*\):.*/\1/p' | tr '\n' ' ')
+          echo "keys=$keys" >> "$GITHUB_OUTPUT"
+      - name: Create issues and assign Copilot
+        env:
+          KEYS: ${{ steps.pick.outputs.keys }}
+        run: |
+          for key in $KEYS; do
+            if gh issue list --state open --search "\"[QA] $key\" in:title" --json number --jq '.[0].number' | grep -q .; then
+              echo "Issue for $key already open; skipping"; continue
+            fi
+            {
+              echo "Automate Jira ticket **$key** end to end."
+              echo
+              echo "Follow \`.github/agents/qa-engineer.agent.md\` exactly, using the \`qa-harness\` MCP tools:"
+              echo "plan, write scenarios under \`mobile-tests/\`, \`discover_scenarios\` until clean,"
+              echo "\`run_on_sauce\`, triage with \`get_failure_evidence\`, fix test defects (max 3 rounds),"
+              echo "\`file_jira_bug\` for product bugs, \`publish_results_to_jira\`, and use"
+              echo "\`get_pr_description\` as the PR description."
+              echo
+              echo "---"
+              qa-harness ticket "$key"
+            } > body.md
+            url=$(gh issue create --title "[QA] $key: automate and validate on Sauce Labs" --body-file body.md --label qa-automation 2>/dev/null \
+                  || gh issue create --title "[QA] $key: automate and validate on Sauce Labs" --body-file body.md)
+            echo "Created $url"
+            gh issue edit "$url" --add-assignee "@copilot" \
+              || echo "::warning::Could not assign Copilot to $url. Set QA_BOT_TOKEN (user PAT) or assign it manually."
+          done

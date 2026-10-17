@@ -1,7 +1,7 @@
 """Harness configuration.
 
-Non-secret settings live in ``qa_harness.yaml``; credentials come only from the
-environment so they never land in the repo, a checkpoint, or a prompt.
+Non-secret settings live in ``qa_harness.yaml``; credentials (Jira, Sauce Labs, optional
+GitHub/Slack) come only from the environment. No LLM key: GitHub Copilot is the agent.
 """
 
 from __future__ import annotations
@@ -15,9 +15,8 @@ from pydantic import BaseModel, Field
 
 
 class AutonomyMode(str, Enum):
-    autonomous = "autonomous"  # every side effect runs without asking
-    supervised = "supervised"  # side effects outside the repo (Jira writes, bugs, PR) ask on the terminal
-    dry_run = "dry_run"  # nothing leaves the machine; side effects are logged only
+    autonomous = "autonomous"  # tools may write to Jira and GitHub
+    dry_run = "dry_run"  # Jira/GitHub writes are logged, not performed (Sauce runs still happen)
 
 
 class ProjectConfig(BaseModel):
@@ -28,17 +27,6 @@ class ProjectConfig(BaseModel):
     base_branch: str = "main"
     branch_prefix: str = "qa/"
     runs_dir: str = ".qa_runs"
-
-
-class LLMConfig(BaseModel):
-    model: str = "claude-opus-5-5"
-    effort: str = "high"  # low | medium | high | xhigh | max
-    triage_effort: str = "high"
-    max_tokens: int = 64000
-    max_agent_turns: int = 60
-    max_usd_per_run: float = 20.0
-    # Route policy declines to Anthropic's recommended fallback model server-side.
-    fallbacks: bool = True
 
 
 class TransitionConfig(BaseModel):
@@ -91,12 +79,8 @@ class GitHubConfig(BaseModel):
 
 class AutonomyConfig(BaseModel):
     mode: AutonomyMode = AutonomyMode.autonomous
-    max_heal_attempts: int = 3
-    max_env_retries: int = 1
     file_bugs: bool = True
-    min_bug_confidence: float = 0.8
     transition_jira: bool = True
-    open_pr_on_product_bug: bool = True  # the tests are still valuable: they reproduce the bug
 
 
 class NotifyConfig(BaseModel):
@@ -105,7 +89,6 @@ class NotifyConfig(BaseModel):
 
 class Settings(BaseModel):
     project: ProjectConfig = ProjectConfig()
-    llm: LLMConfig = LLMConfig()
     jira: JiraConfig = JiraConfig()
     sauce: SauceConfig = SauceConfig()
     github: GitHubConfig = GitHubConfig()

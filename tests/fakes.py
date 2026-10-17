@@ -1,93 +1,61 @@
-"""Test doubles: a scripted LLM, a scripted Sauce executor, and fake Anthropic responses."""
+"""Test doubles: a scripted Sauce executor, a Maven-free framework, and HTTP recorders."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from types import SimpleNamespace
-from typing import Any
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from qa_harness.config import DeviceConfig, LLMConfig
-from qa_harness.framework import CucumberMaven, Discovery
-from qa_harness.llm import LLM, AgentOutcome
-from qa_harness.models import (
-    BugReport,
-    CaseKind,
-    FailureCategory,
-    FailureVerdict,
-    GeneratedFile,
-    GenerationResult,
-    Outcome,
-    Platform,
-    RunSummary,
-    TestCase,
-    TestPlan,
-    TestResult,
-    TestStep,
-    TriageReport,
+import httpx2 as httpx
+
+from qa_harness.config import (
+    AutonomyMode,
+    DeviceConfig,
+    GitHubConfig,
+    JiraConfig,
+    Secrets,
+    Settings,
+    TransitionConfig,
 )
-from qa_harness.tools import ToolRegistry
+from qa_harness.framework import CucumberMaven, Discovery
+from qa_harness.integrations.github import Git, GitHubClient
+from qa_harness.integrations.jira import JiraClient
+from qa_harness.models import Outcome, RunSummary, TestResult
+from qa_harness.services import Services
 
-# ---------------------------------------------------------------------- canned data
-
-
-def make_plan(key: str = "APP-1") -> TestPlan:
-    return TestPlan(
-        ticket_key=key,
-        feature_summary="Login shows an error for a wrong password",
-        risks=["error banner missing on iOS"],
-        out_of_scope=[],
-        ambiguities=["Exact error copy not specified; assumed it contains 'invalid'"],
-        test_cases=[
-            TestCase(
-                id="TC-01",
-                title="Wrong password shows error",
-                kind=CaseKind.negative,
-                priority=1,
-                preconditions=["App freshly installed"],
-                steps=[TestStep(action="Log in with a wrong password", expected="Error is shown")],
-                platforms=[Platform.android],
-                traces_to=["AC1"],
-                automatable=True,
-                automation_notes="",
-            )
-        ],
-    )
-
-
-TEST_FILE = "mobile-tests/src/test/resources/features/app_1/login.feature"
-TEST_SOURCE = """@APP-1
+FEATURE = "mobile-tests/src/test/resources/features/app_1/login.feature"
+NODE = "src/test/resources/features/app_1/login.feature:5"
+FEATURE_TEXT = """@APP-1
 Feature: Login errors
 
   @TC-01 @P1
   Scenario: Wrong password shows error
     Given the login screen is displayed
 """
-NODE = "src/test/resources/features/app_1/login.feature:5"
 
+ANDROID_SOURCE = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
+    <android.widget.EditText resource-id="com.app:id/user" content-desc="username-input" text="" clickable="true"/>
+    <android.widget.Button resource-id="com.app:id/sign_in" content-desc="sign-in-button" text="Sign in"
+        clickable="true"/>
+    <android.view.View bounds="[0,0][10,10]"/>
+  </android.widget.FrameLayout>
+</hierarchy>"""
 
-def write_test_via_tools(tools: ToolRegistry) -> GenerationResult:
-    out, err = tools.execute("write_file", {"path": TEST_FILE, "content": TEST_SOURCE})
-    assert not err, out
-    return GenerationResult(
-        files=[GeneratedFile(path=TEST_FILE, purpose="feature")], test_node_ids=[NODE], summary="1 scenario"
-    )
+DEVICES = [
+    DeviceConfig(name="pixel", platform="android", device_name="Google Pixel 8"),
+    DeviceConfig(name="iphone", platform="ios", device_name="iPhone 15"),
+]
 
 
 class FakeFramework(CucumberMaven):
-    """Real path handling; compile/discover simulated by scanning feature files (no Maven needed).
-
-    Any file under the project containing BROKEN makes compilation fail."""
+    """Real path handling; compile/discover simulated by scanning feature files (no Maven)."""
 
     def compile(self) -> tuple[bool, str]:
-        for f in self.project_dir.rglob("*"):
-            if f.is_file() and f.suffix in (".java", ".feature") and "BROKEN" in f.read_text():
-                return False, f"compilation error in {f.name}"
         return True, "compiled"
 
     def discover(self, features=None) -> Discovery:
-        ok, out = self.compile()
-        if not ok:
-            return Discovery(compiled=False, output=out)
         ids = []
         for rel in features or []:
             for n, line in enumerate((self.project_dir / rel).read_text().splitlines(), 1):
@@ -96,68 +64,14 @@ class FakeFramework(CucumberMaven):
         return Discovery(ids=ids)
 
 
-def verdict(category: FailureCategory, device: str = "pixel", confidence: float = 0.9) -> FailureVerdict:
-    return FailureVerdict(
-        node_id=NODE,
-        device=device,
-        category=category,
-        confidence=confidence,
-        root_cause=f"{category.value} root cause",
-        evidence=["line from page source"],
-        suggested_fix="do the thing",
-    )
-
-
-BUG = BugReport(
-    title="Login error banner missing for wrong password",
-    severity="Major",
-    environment="Pixel 8, Android 14",
-    steps_to_reproduce=["Open app", "Enter wrong password", "Tap Login"],
-    expected="Error banner",
-    actual="Nothing happens",
-    evidence=["login-error absent from page source"],
-    violated_criteria=["AC1"],
-)
-
-# ---------------------------------------------------------------------- scripted LLM
-
-
-class ScriptedLLM(LLM):
-    """Returns queued results per output type; agent calls run a callable against the real tools."""
-
-    def __init__(self) -> None:
-        super().__init__(LLMConfig(max_usd_per_run=100), client=SimpleNamespace())
-        self.structured_queue: dict[type, list[Any]] = {}
-        self.agent_queue: list[Callable[[ToolRegistry], Any]] = []
-        self.calls: list[str] = []
-
-    def queue(self, output_type: type, *values: Any) -> ScriptedLLM:
-        self.structured_queue.setdefault(output_type, []).extend(values)
-        return self
-
-    def structured(self, *, system, content, output, effort=None):
-        self.calls.append(output.__name__)
-        q = self.structured_queue.get(output)
-        if not q:
-            raise AssertionError(f"unexpected structured call for {output.__name__}")
-        return q.pop(0)
-
-    def run_agent(self, *, system, task, tools, result_model, effort=None, max_turns=None):
-        self.calls.append(f"agent:{result_model.__name__}")
-        return AgentOutcome(result=self.agent_queue.pop(0)(tools), turns=1)
-
-
-# ---------------------------------------------------------------------- scripted executor
-
-
 class ScriptedExecutor:
-    def __init__(self, devices: list[DeviceConfig], outcomes: list[dict[str, Outcome]]):
-        self._devices = devices
-        self.outcomes = outcomes  # one dict per attempt: device -> outcome
-        self.calls: list[dict[str, list[str]]] = []
+    """Returns scripted outcomes per attempt; failures get a real page source + screenshot on disk."""
 
-    def devices(self) -> list[DeviceConfig]:
-        return self._devices
+    def __init__(self, outcomes: list[dict[str, Outcome]], message: str = "NoSuchElementException: login-button"):
+        self.outcomes = outcomes
+        self.message = message
+        self.calls: list[dict[str, list[str]]] = []
+        self.root: Path | None = None
 
     def run(self, targets, attempt, build) -> RunSummary:
         self.calls.append(targets)
@@ -166,73 +80,91 @@ class ScriptedExecutor:
         for device, ids in targets.items():
             for node in ids:
                 outcome = script.get(device, Outcome.passed)
+                artifacts = {}
+                if outcome != Outcome.passed:
+                    d = self.root / f"attempt{attempt}" / device
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / "page_source.xml").write_text(ANDROID_SOURCE)
+                    (d / "screenshot.png").write_bytes(b"\x89PNG fake")
+                    artifacts = {"page_source": str(d / "page_source.xml"), "screenshot": str(d / "screenshot.png")}
                 results.append(
                     TestResult(
                         node_id=node,
+                        name="Wrong password shows error",
                         device=device,
                         outcome=outcome,
-                        message="" if outcome == Outcome.passed else "AssertionError: banner not found",
+                        message="" if outcome == Outcome.passed else self.message,
                         sauce_job_id=f"job-{attempt}-{device}",
                         sauce_url=f"https://app.saucelabs.com/tests/job-{attempt}-{device}",
+                        artifacts=artifacts,
                     )
                 )
         return RunSummary(attempt=attempt, results=results)
 
 
-def triage(*verdicts: FailureVerdict) -> TriageReport:
-    return TriageReport(verdicts=list(verdicts), summary="triaged")
+class Recorder:
+    """Mock HTTP transport for Jira + GitHub that records every call."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content[:1] == b"{" else {}
+        self.calls.append((request.method, request.url.path, body))
+        p = request.url.path
+        if p.endswith("/transitions") and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "transitions": [
+                        {"id": "1", "name": "QA Passed", "to": {"name": "QA Passed"}},
+                        {"id": "2", "name": "QA Failed", "to": {"name": "QA Failed"}},
+                    ]
+                },
+            )
+        if p.endswith("/rest/api/3/issue") and request.method == "POST":
+            return httpx.Response(201, json={"key": "APP-99"})
+        if p.endswith("/pulls") and request.method == "GET":
+            return httpx.Response(200, json=[])
+        if p.endswith("/pulls") and request.method == "POST":
+            return httpx.Response(201, json={"number": 7, "html_url": "https://github.com/o/r/pull/7"})
+        return httpx.Response(200, json={})
+
+    def writes(self) -> list[tuple[str, str]]:
+        return [(m, p) for m, p, _ in self.calls if m != "GET"]
+
+    def body(self, method: str, suffix: str) -> dict:
+        return next(b for m, p, b in self.calls if m == method and p.endswith(suffix))
 
 
-# ---------------------------------------------------------------------- fake Anthropic client
+@dataclass
+class FakeServices(Services):
+    scripted: ScriptedExecutor | None = None
+    recorder: Recorder = field(default_factory=Recorder)
+
+    def executor(self, artifacts_root):
+        self.scripted.root = artifacts_root
+        return self.scripted
 
 
-def usage(inp: int = 1000, out: int = 500) -> SimpleNamespace:
-    return SimpleNamespace(
-        input_tokens=inp, output_tokens=out, cache_read_input_tokens=0, cache_creation_input_tokens=0
+def make_services(
+    repo: Path, executor: ScriptedExecutor, mode=AutonomyMode.autonomous, github: bool = True
+) -> FakeServices:
+    settings = Settings()
+    settings.project.repo_root = repo
+    settings.sauce.devices = DEVICES
+    settings.autonomy.mode = mode
+    settings.jira = JiraConfig(
+        base_url="https://x.atlassian.net", transitions=TransitionConfig(on_pass="QA Passed", on_fail="QA Failed")
     )
-
-
-def text_block(text: str) -> SimpleNamespace:
-    return SimpleNamespace(type="text", text=text)
-
-
-def tool_use(id_: str, name: str, input_: Any) -> SimpleNamespace:
-    return SimpleNamespace(type="tool_use", id=id_, name=name, input=input_)
-
-
-def response(*blocks, stop_reason: str = "tool_use", model: str = "claude-opus-5-5") -> SimpleNamespace:
-    return SimpleNamespace(content=list(blocks), stop_reason=stop_reason, usage=usage(), model=model, stop_details=None)
-
-
-class FakeAnthropic:
-    """Mimics client.beta.messages.{stream,parse} with queued responses; records requests."""
-
-    def __init__(self, responses: list[SimpleNamespace]):
-        self.responses = list(responses)
-        self.requests: list[dict[str, Any]] = []
-        outer = self
-
-        class _Stream:
-            def __init__(self, resp):
-                self.resp = resp
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def get_final_message(self):
-                return self.resp
-
-        class _Messages:
-            def stream(self, **kw):
-                # Snapshot: the caller mutates `messages` after the call returns.
-                outer.requests.append({**kw, "messages": list(kw["messages"])})
-                return _Stream(outer.responses.pop(0))
-
-            def parse(self, **kw):
-                outer.requests.append(kw)
-                return outer.responses.pop(0)
-
-        self.beta = SimpleNamespace(messages=_Messages())
+    rec = Recorder()
+    return FakeServices(
+        settings=settings,
+        secrets=Secrets(),
+        framework=FakeFramework(repo / "mobile-tests", repo),
+        jira=JiraClient(settings.jira, "e", "t", transport=httpx.MockTransport(rec)),
+        git=Git(repo),
+        github=GitHubClient(GitHubConfig(), "tok", "o/r", transport=httpx.MockTransport(rec)) if github else None,
+        scripted=executor,
+        recorder=rec,
+    )

@@ -9,9 +9,9 @@ import shutil
 import pytest
 
 from qa_harness.config import DeviceConfig, Secrets, Settings
+from qa_harness.executor import SauceExecutor
 from qa_harness.framework import CucumberMaven
 from qa_harness.models import Outcome
-from qa_harness.stages.executor import SauceExecutor
 
 pytestmark = pytest.mark.skipif(not (shutil.which("mvn") and shutil.which("java")), reason="needs Maven + JDK")
 
@@ -103,53 +103,3 @@ def test_compile_error_becomes_error_results(project):
     )
     assert [r.outcome for r in summary.results] == [Outcome.error]
     assert "Broken.java" in summary.results[0].traceback
-
-
-def test_pipeline_discovers_generated_feature_with_real_maven(sandbox_repo):
-    """Generate stage -> real Maven compile + Cucumber dry run -> scenario ids handed to execution."""
-    from qa_harness.config import AutonomyMode
-    from qa_harness.models import GeneratedFile, GenerationResult, TestPlan, Ticket
-    from qa_harness.pipeline import Deps, Pipeline, new_state
-    from qa_harness.state import Guard, RunStore
-
-    from .fakes import ScriptedExecutor, ScriptedLLM, make_plan
-
-    feature = "mobile-tests/src/test/resources/features/app_1/login_errors.feature"
-
-    def generate(tools):
-        out, err = tools.execute(
-            "write_file",
-            {
-                "path": feature,
-                "content": "@APP-1\nFeature: Login errors\n\n  @TC-01 @P1\n  Scenario: Wrong password shows error\n"
-                "    Given the login screen is displayed\n"
-                '    When I log in as "u" with password "bad"\n'
-                '    Then I see a login error containing "invalid"\n',
-            },
-        )
-        assert not err, out
-        out, err = tools.execute("cucumber_dry_run", {"features": [feature]})
-        assert "0 with problems" in out, out
-        return GenerationResult(files=[GeneratedFile(path=feature, purpose="f")], test_node_ids=[], summary="s")
-
-    settings = Settings()
-    settings.project.repo_root = sandbox_repo
-    settings.sauce.devices = [DeviceConfig(name="pixel", platform="android", device_name="Pixel")]
-    settings.autonomy.mode = AutonomyMode.dry_run
-    llm = ScriptedLLM().queue(TestPlan, make_plan())
-    llm.agent_queue.append(generate)
-    executor = ScriptedExecutor(settings.sauce.devices, [{}])
-    deps = Deps(
-        settings=settings,
-        secrets=Secrets(),
-        llm=llm,
-        framework=CucumberMaven(settings.tests_root, sandbox_repo),
-        executor=executor,
-        load_ticket=lambda k: Ticket(key=k, summary="Login"),
-    )
-    state = new_state("APP-1")
-    store = RunStore(settings.runs_root, state.run_id)
-    result = Pipeline(deps, store, state, Guard(AutonomyMode.dry_run, store)).run()
-
-    assert result.status == "passed"
-    assert executor.calls == [{"pixel": ["src/test/resources/features/app_1/login_errors.feature:5"]}]

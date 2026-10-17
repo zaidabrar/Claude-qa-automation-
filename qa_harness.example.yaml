@@ -1,5 +1,5 @@
 # Copy to qa_harness.yaml and adjust. Secrets never go here; they come from the
-# environment (see .env.example).
+# environment (see .env.example). No LLM key: GitHub Copilot is the agent.
 
 project:
   repo_root: .              # repo containing the Appium suite (relative to this file)
@@ -9,16 +9,9 @@ project:
   base_branch: main
   branch_prefix: qa/
 
-llm:
-  model: claude-opus-5-5
-  effort: high              # planning + generation + healing; raise to xhigh for complex apps
-  triage_effort: high
-  max_usd_per_run: 20       # hard stop; the run checkpoints and can be resumed
-  fallbacks: true           # server-side fallback model if a request is declined
-
 jira:
   base_url: https://your-company.atlassian.net
-  # Tickets the autonomous watcher picks up. Tickets already labelled done_label are skipped.
+  # Tickets qa_ready_tickets / the jira-to-copilot workflow pick up; done_label ones are skipped.
   ready_jql: 'project = APP AND status = "Ready for QA" AND labels = "qa-ai" ORDER BY priority DESC'
   acceptance_criteria_field: null   # e.g. customfield_10042 if AC lives in a custom field
   transitions:
@@ -61,15 +54,11 @@ github:
   labels: [qa-automation, ai-generated]
 
 autonomy:
-  # autonomous: no prompts. supervised: confirm Jira writes / bugs / push / PR in the terminal.
-  # dry_run: everything runs locally (tests still execute on Sauce) but nothing is written to Jira/GitHub.
+  # autonomous: tools write to Jira/GitHub. dry_run: those writes are logged only (Sauce runs still happen).
+  # VS Code also asks you to approve each MCP tool call unless you auto-approve it.
   mode: autonomous
-  max_heal_attempts: 3
-  max_env_retries: 1
   file_bugs: true
-  min_bug_confidence: 0.8           # only file bugs when triage is at least this sure
   transition_jira: true
-  open_pr_on_product_bug: true
 
 notify:
   slack_webhook_env: SLACK_WEBHOOK_URL

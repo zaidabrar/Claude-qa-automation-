@@ -7,10 +7,10 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ..config import DeviceConfig, Secrets, Settings
-from ..framework import TestFramework
-from ..integrations.saucelabs import SauceClient
-from ..models import Outcome, RunSummary, TestResult
+from .config import DeviceConfig, Secrets, Settings
+from .framework import TestFramework
+from .integrations.saucelabs import SauceClient
+from .models import Outcome, RunSummary, TestResult
 
 Targets = dict[str, list[str]]  # device name -> scenario ids
 

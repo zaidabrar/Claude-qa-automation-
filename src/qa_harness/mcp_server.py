@@ -1,147 +1,155 @@
-"""MCP server exposing the harness to GitHub Copilot agent mode (or any MCP client).
+"""MCP server: the QA toolbox GitHub Copilot drives (VS Code agent mode, or the Copilot coding agent).
 
-Copilot does the interactive authoring in the IDE; these tools give it what it cannot
-do alone: read the Jira ticket, validate Cucumber glue, run scenarios on Sauce Labs
-real devices with evidence for healing, and hand a ticket to the autonomous pipeline.
+Copilot is the brain: it plans, writes the Cucumber scenarios and Java glue, triages failures and
+fixes tests. These tools are its hands for what an editor cannot do: Jira, compiling and binding
+the suite, Sauce Labs real devices, failure evidence, bug filing, reporting, and the pull request.
 
-Configured in .vscode/mcp.json:  qa-harness --config qa_harness.yaml mcp
+    qa-harness --config qa_harness.yaml mcp      (registered in .vscode/mcp.json)
 """
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import time
-from pathlib import Path
+from collections.abc import Callable
+from functools import wraps
 
 from mcp.server.mcpserver import MCPServer
 
-from .config import AutonomyMode, Secrets, Settings
-from .integrations.jira import JiraClient
-from .integrations.saucelabs import SauceClient
-from .models import Outcome
-from .stages.executor import SauceExecutor
-from .stages.planner import render_ticket
-from .stages.reporter import render_report
-from .state import RunState
+from . import ops
+from .config import Settings
+from .models import BugReport
+from .services import Services
+from .state import RunStore
 
 INSTRUCTIONS = """\
-Tools for the mobile QA workflow in this repository (Appium Java + TestNG + Cucumber on Sauce Labs).
-Typical loop: get_jira_ticket -> write the feature, steps, and page objects -> discover_scenarios until clean
--> run_on_sauce -> on failure, read the returned page_source file and fix locators from real attributes -> re-run.
-Use start_autonomous_run to hand a whole ticket to the autonomous pipeline instead."""
+QA toolbox for this repository (Appium Java + TestNG + Cucumber on Sauce Labs). Workflow:
+1. jira_get_ticket → plan scenarios from the acceptance criteria.
+2. Write the feature, steps, and page objects → discover_scenarios until there are 0 problems.
+3. run_on_sauce(ticket_key, scenario_ids) → note the run_id.
+4. For each failure, get_failure_evidence → decide: test defect (fix, then run_on_sauce with the same run_id),
+   environment (re-run once), or product bug (file_jira_bug).
+5. publish_results_to_jira and open_pull_request (or get_pr_description when the platform opens the PR).
+Results, statuses, and bug eligibility are taken from the recorded Sauce Labs runs, never from claims."""
 
 
-def build_server(settings: Settings) -> MCPServer:
-    # Imported here so `qa-harness` works without the MCP extra unless this command is used.
-    from .cli import build_framework
+def _safe(fn: Callable[..., str]) -> Callable[..., str]:
+    """Return errors as text so the agent can read them and adapt."""
 
+    @wraps(fn)
+    def wrapper(*args, **kwargs) -> str:
+        try:
+            return fn(*args, **kwargs)
+        except (ValueError, RuntimeError, FileNotFoundError, KeyError) as exc:
+            return f"Error: {exc}"
+
+    return wrapper
+
+
+def build_server(settings: Settings, services: Services | None = None) -> MCPServer:
+    svc = services or Services.from_settings(settings)
     server = MCPServer("qa-harness", instructions=INSTRUCTIONS)
-    secrets = Secrets.from_env(settings.notify)
-    framework = build_framework(settings)
-
-    def jira() -> JiraClient:
-        if not (settings.jira.base_url and secrets.jira_email and secrets.jira_token):
-            raise RuntimeError("Jira is not configured: set jira.base_url, JIRA_EMAIL and JIRA_API_TOKEN")
-        return JiraClient(settings.jira, secrets.jira_email, secrets.jira_token)
 
     @server.tool()
-    def get_jira_ticket(ticket_key: str) -> str:
-        """Fetch a Jira ticket: summary, description, acceptance criteria, comments, and links."""
-        return render_ticket(jira().get_ticket(ticket_key))
+    @_safe
+    def qa_ready_tickets(limit: int = 20) -> str:
+        """List Jira tickets waiting for QA automation (jira.ready_jql, excluding ones already done)."""
+        return ops.ready_tickets(svc, limit)
 
     @server.tool()
+    @_safe
+    def jira_get_ticket(ticket_key: str) -> str:
+        """Fetch a Jira ticket: summary, description, acceptance criteria, comments, and linked issues."""
+        return ops.get_ticket(svc, ticket_key)
+
+    @server.tool()
+    @_safe
     def list_devices() -> str:
-        """List the Sauce Labs device matrix configured in qa_harness.yaml."""
-        return (
-            "\n".join(
-                f"- {d.name}: {d.platform} {d.platform_version} {d.device_name!r} ({'real' if d.real_device else 'vm'})"
-                for d in settings.sauce.devices
-            )
-            or "No devices configured (sauce.devices)."
-        )
+        """The Sauce Labs device matrix configured for this repo."""
+        return ops.list_devices(svc)
 
     @server.tool()
+    @_safe
     def discover_scenarios(feature_files: list[str] | None = None) -> str:
-        """Compile the test project and Cucumber dry-run the given feature files (repo-relative paths; empty
-        means the whole suite). Returns scenario ids (feature:line) and any undefined or ambiguous steps."""
-        features = [framework.to_project_path(f) or f for f in (feature_files or [])]
-        return framework.discover(features or None).summary()
+        """Compile the test project and Cucumber dry-run the given feature files (repo-relative; empty means
+        all). Returns scenario ids (feature:line) and every undefined or ambiguous step. Uses no device."""
+        return ops.discover(svc, feature_files)
 
     @server.tool()
-    def run_on_sauce(scenario_ids: list[str], devices: list[str] | None = None) -> str:
-        """Run scenarios (ids from discover_scenarios, e.g.
-        src/test/resources/features/app_123/login.feature:12) on Sauce Labs real devices.
-        Returns per-device results, Sauce video links, and for failures the failing step, the error, and the
-        paths of the captured screenshot and page source XML to use when fixing locators."""
-        if not (secrets.sauce_username and secrets.sauce_access_key):
-            return "Sauce Labs is not configured: set SAUCE_USERNAME and SAUCE_ACCESS_KEY."
-        names = devices or [d.name for d in settings.sauce.devices]
-        unknown = set(names) - {d.name for d in settings.sauce.devices}
-        if unknown:
-            return f"Unknown device(s): {', '.join(sorted(unknown))}. Use list_devices."
-        run_dir = settings.runs_root / f"copilot-{time.strftime('%Y%m%dT%H%M%S')}"
-        sauce = SauceClient(settings.sauce, secrets.sauce_username, secrets.sauce_access_key)
-        executor = SauceExecutor(settings, secrets, sauce, framework, run_dir)
-        summary = executor.run({n: list(scenario_ids) for n in names}, 1, f"copilot-{run_dir.name}")
-
-        lines = [f"Results ({summary.counts()}), artifacts in {_rel(run_dir, settings)}:"]
-        for r in summary.results:
-            lines.append(f"- {r.outcome.value.upper()} {r.name or r.node_id} on {r.device} {r.sauce_url or ''}")
-            if r.outcome in (Outcome.failed, Outcome.error):
-                lines.append(f"  error: {r.message[:1500]}")
-                for name, path in r.artifacts.items():
-                    lines.append(f"  {name}: {_rel(Path(path), settings)}")
-        return "\n".join(lines)
+    @_safe
+    def run_on_sauce(
+        ticket_key: str, scenario_ids: list[str], devices: list[str] | None = None, run_id: str | None = None
+    ) -> str:
+        """Run scenarios on Sauce Labs real devices (all configured devices unless `devices` is given).
+        Pass the previous run_id when re-running after a fix so attempts are grouped. Returns results with
+        Sauce video links and a first-guess hint for each failure."""
+        return ops.run_scenarios(svc, ticket_key, scenario_ids, devices, run_id)[1]
 
     @server.tool()
-    def plan_tests(ticket_key: str) -> str:
-        """Use Claude to draft a test plan for a ticket, with every case traced to acceptance criteria.
-        Requires ANTHROPIC_API_KEY."""
-        from .llm import LLM
-        from .stages.planner import build_plan
-
-        plan = build_plan(LLM(settings.llm), jira().get_ticket(ticket_key), settings)
-        return plan.model_dump_json(indent=2)
+    @_safe
+    def get_failure_evidence(run_id: str, scenario_id: str, device: str) -> str:
+        """Everything needed to triage one failure: error, failing step, stack trace, the locator inventory
+        from the page source at failure, crash lines from device logs, other devices, and flake history."""
+        return ops.failure_evidence(svc, run_id, scenario_id, device)
 
     @server.tool()
-    def start_autonomous_run(ticket_key: str, mode: str = "dry_run") -> str:
-        """Hand a ticket to the autonomous pipeline: plan, generate, run on Sauce Labs, triage and self-heal,
-        file bugs, open a PR, and update Jira. mode is 'dry_run' (no Jira/GitHub writes) or 'autonomous'.
-        Runs in the background; poll with get_run_status."""
-        if mode not in (AutonomyMode.dry_run.value, AutonomyMode.autonomous.value):
-            return "mode must be 'dry_run' or 'autonomous'"
-        settings.runs_root.mkdir(parents=True, exist_ok=True)
-        log = settings.runs_root / f"{ticket_key}-mcp.log"
-        subprocess.Popen(
-            [sys.executable, "-m", "qa_harness.cli", "--mode", mode, "run", ticket_key],
-            cwd=settings.repo_root,
-            stdout=log.open("w"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    @_safe
+    def file_jira_bug(
+        run_id: str,
+        scenario_id: str,
+        title: str,
+        severity: str,
+        steps_to_reproduce: list[str],
+        expected: str,
+        actual: str,
+        violated_criteria: list[str] | None = None,
+        evidence: list[str] | None = None,
+    ) -> str:
+        """File a product bug for a scenario that is failing in the recorded run. The bug gets screenshots,
+        Sauce Labs session links, device list, and a link to the source ticket. Severity is one of
+        Blocker, Critical, Major, Minor, Trivial. Only for app defects, never for test defects."""
+        bug = BugReport(
+            title=title,
+            severity=severity,
+            steps_to_reproduce=steps_to_reproduce,
+            expected=expected,
+            actual=actual,
+            violated_criteria=violated_criteria or [],
+            evidence=evidence or [],
         )
-        return f"Started {ticket_key} in {mode} mode. Log: {_rel(log, settings)}. Poll get_run_status('{ticket_key}')."
+        return ops.file_bug(svc, run_id, scenario_id, bug)
 
     @server.tool()
-    def get_run_status(ticket_key: str) -> str:
-        """Status and report of the latest pipeline run for a ticket."""
-        runs = sorted(settings.runs_root.glob(f"{ticket_key}-*/state.json"), key=lambda p: p.stat().st_mtime)
-        if not runs:
-            return f"No runs found for {ticket_key}."
-        state = RunState.model_validate_json(runs[-1].read_text())
-        head = f"Run {state.run_id}: {state.status}; stages done: {', '.join(state.completed_stages) or 'none'}"
-        if state.error:
-            head += f"\nError: {state.error}"
-        return head + "\n\n" + render_report(state)
+    @_safe
+    def publish_results_to_jira(run_id: str) -> str:
+        """Comment the run report on the Jira ticket, transition it by the recorded result (pass/fail), and add
+        the done label."""
+        return ops.publish_to_jira(svc, run_id)
+
+    @server.tool()
+    @_safe
+    def get_pr_description(run_id: str) -> str:
+        """Markdown PR description for a run: scenario × device matrix with Sauce links, failures, bugs."""
+        return ops.pr_description(svc, run_id)
+
+    @server.tool()
+    @_safe
+    def open_pull_request(run_id: str, title: str | None = None) -> str:
+        """Commit the changes under the test project to a QA branch, push, and open a draft PR whose description
+        is the run report. Not needed in the Copilot coding agent, which opens its own PR (use
+        get_pr_description there)."""
+        return ops.open_pull_request(svc, run_id, title)
+
+    @server.tool()
+    @_safe
+    def get_run_report(ticket_key_or_run_id: str) -> str:
+        """Report for a run id, or for the latest run of a ticket key."""
+        run_id = ticket_key_or_run_id
+        if not (settings.runs_root / run_id / "run.json").exists():
+            run_id = RunStore.latest_id(settings.runs_root, ticket_key_or_run_id) or ""
+        if not run_id:
+            return f"No runs found for {ticket_key_or_run_id}."
+        return f"run_id: {run_id}\n\n" + ops.pr_description(svc, run_id)
 
     return server
-
-
-def _rel(path: Path, settings: Settings) -> str:
-    try:
-        return str(path.resolve().relative_to(settings.repo_root))
-    except ValueError:
-        return str(path)
 
 
 def serve(settings: Settings) -> None:

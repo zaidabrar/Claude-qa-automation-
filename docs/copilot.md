@@ -1,39 +1,40 @@
-# Using the harness with GitHub Copilot
+# Setting up GitHub Copilot
 
-The team writes and reviews tests in the IDE with GitHub Copilot, while the harness runs the same workflow
-unattended in CI. Both follow **one set of conventions** and share **one set of tools**:
+Copilot is the agent, and this repo gives it the workflow, the conventions, and the tools. No LLM API key is involved.
 
-| | Interactive (engineer + Copilot) | Autonomous (qa-harness in CI) |
+| Piece | File | Used by |
 |---|---|---|
-| Conventions | `.github/copilot-instructions.md` + `.github/instructions/*.instructions.md` (applied by Copilot automatically) | The generator and healer agents are told to read the same files |
-| Jira | `get_jira_ticket` MCP tool | Jira REST, automatic |
-| Validate glue | `discover_scenarios` MCP tool | `cucumber_dry_run` agent tool |
-| Run on devices | `run_on_sauce` MCP tool | Executor, every configured device |
-| Fix failures | `/heal-scenario` prompt + page source from `run_on_sauce` | Triage + self-heal loop |
-| Ship | You open the PR | Draft PR + Jira update |
+| QA agent profile (workflow, triage and fix rules) | `.github/agents/qa-engineer.agent.md` | VS Code agent mode, Copilot coding agent |
+| Team conventions | `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md` | Chat, agent mode, coding agent, code review |
+| Prompt files | `.github/prompts/*.prompt.md` | VS Code / JetBrains Copilot Chat |
+| MCP toolbox | `qa-harness mcp` (`.vscode/mcp.json`) | VS Code agent mode, coding agent |
+| Coding agent environment | `.github/workflows/copilot-setup-steps.yml` | Copilot coding agent |
+| Jira → Copilot dispatcher | `.github/workflows/jira-to-copilot.yml` | Hands-free mode |
 
-Edit the instruction files when the team's conventions change, and both Copilot and the autonomous agent follow.
+## 1. VS Code (agent mode)
 
-## 1. Copilot Chat in VS Code / IntelliJ (agent mode)
+1. `pip install -e .`, copy `qa_harness.example.yaml` to `qa_harness.yaml`, and fill `.env` from `.env.example`
+   (Jira + Sauce Labs).
+2. Open the repo. `.vscode/mcp.json` registers the `qa-harness` server and loads `.env`. Start it from the MCP
+   view, or accept the prompt, then check that its 11 tools appear in the agent's tool picker.
+3. Open Copilot Chat, choose **Agent** mode (or select the `qa-engineer` agent if your VS Code lists custom
+   agents), and run:
+   - `/automate-ticket` for the full flow on one ticket;
+   - `/heal-scenario` to triage and fix one failing scenario;
+   - `/qa-sweep` to process every ticket in `jira.ready_jql`.
+4. VS Code asks before each tool call. For a hands-off run, auto-approve the read and run tools
+   (`jira_get_ticket`, `discover_scenarios`, `run_on_sauce`, `get_failure_evidence`, ...) and keep approval on the
+   writes (`file_jira_bug`, `publish_results_to_jira`, `open_pull_request`). Set `autonomy.mode: dry_run` while
+   you evaluate.
 
-1. `pip install -e '.[mcp]'`, copy `qa_harness.example.yaml` to `qa_harness.yaml`, and fill `.env` from `.env.example`.
-2. Open the repo in VS Code. `.vscode/mcp.json` registers the `qa-harness` MCP server (`qa-harness mcp`) and
-   loads credentials from `.env`. Start it from the MCP view, or accept the prompt.
-   *IntelliJ: add the same server in Copilot → MCP settings (`command: qa-harness`,
-   `args: ["--config", "<repo>/qa_harness.yaml", "mcp"]`, plus the env vars).*
-3. In Copilot Chat, switch to **Agent** mode and run one of the prompt files:
-   - `/automate-ticket` goes from ticket to feature, steps, and page objects, then dry-runs and runs on Sauce Labs, fixing from page source.
-   - `/heal-scenario` fixes a failing scenario from the device's real page source.
-   - `/hand-off-to-qa-agent` passes a ticket to the autonomous pipeline and reports back.
+**JetBrains (IntelliJ):** add an MCP server in the Copilot settings with command `qa-harness`, args
+`--config <repo>/qa_harness.yaml mcp`, and the same environment variables. Prompt files and instructions are
+picked up from `.github/`.
 
-MCP tools: `get_jira_ticket`, `plan_tests` (Claude test plan; needs `ANTHROPIC_API_KEY`), `list_devices`,
-`discover_scenarios`, `run_on_sauce`, `start_autonomous_run`, `get_run_status`.
+## 2. Copilot coding agent (unattended, in GitHub's cloud)
 
-## 2. Copilot coding agent (assign an issue to Copilot)
-
-`.github/workflows/copilot-setup-steps.yml` installs the JDK, warms the Maven cache, and installs `qa-harness`
-in Copilot's environment. To let it run scenarios on Sauce Labs, go to **Settings → Copilot → Coding agent → MCP
-configuration** and add:
+1. `copilot-setup-steps.yml` already installs the JDK, warms the Maven cache, and installs `qa-harness`.
+2. In the repository, go to **Settings → Copilot → Coding agent → MCP configuration** and add:
 
 ```json
 {
@@ -42,7 +43,7 @@ configuration** and add:
       "type": "local",
       "command": "qa-harness",
       "args": ["--config", "qa_harness.yaml", "mcp"],
-      "tools": ["get_jira_ticket", "list_devices", "discover_scenarios", "run_on_sauce"],
+      "tools": ["*"],
       "env": {
         "JIRA_EMAIL": "COPILOT_MCP_JIRA_EMAIL",
         "JIRA_API_TOKEN": "COPILOT_MCP_JIRA_API_TOKEN",
@@ -54,19 +55,32 @@ configuration** and add:
 }
 ```
 
-and create the `COPILOT_MCP_*` secrets in the repository's `copilot` environment. Then an issue such as
-*"Automate APP-123 with /automate-ticket"* assigned to Copilot produces a PR whose scenarios have already run
-on real devices.
+3. Create those `COPILOT_MCP_*` secrets in the repository's **copilot** environment.
+4. Allow outbound access to your Jira site, `api.<region>.saucelabs.com` and `ondemand.<region>.saucelabs.com` in
+   the coding agent's firewall settings, if the firewall is enabled.
+5. Assign an issue such as *"[QA] APP-123: automate and validate on Sauce Labs"* to Copilot. It follows
+   `qa-engineer.agent.md`, so it runs on Sauce Labs, files bugs, reports to Jira, and opens a PR whose description
+   comes from `get_pr_description`.
 
-## 3. Copilot code review
+Check the exact screen names and JSON fields against GitHub's current Copilot coding agent docs, since GitHub
+revises this area often.
 
-Copilot code review reads `.github/copilot-instructions.md` too, so agent-authored PRs (from either engine) are
-reviewed against the same rules: no sleeps, no absolute XPath, no weakened assertions, and steps reused rather
-than duplicated.
+## 3. Hands-free: Jira → Copilot
 
-## Which engine for what
+`.github/workflows/jira-to-copilot.yml` turns Jira tickets into issues assigned to the Copilot coding agent:
 
-- **Copilot (interactive):** exploratory automation, tricky screens, and reviewing and adjusting generated tests.
-  The engineer stays in the loop.
-- **qa-harness (autonomous, Claude):** the steady flow of "Ready for QA" tickets, unattended, with triage, bug
-  filing, a cost cap, and an audit log. Triggered by Jira Automation or a schedule.
+- **Jira Automation** (recommended): use the rule *When issue transitioned to Ready for QA → Send web request*,
+  with `POST https://api.github.com/repos/<owner>/<repo>/dispatches`, header `Authorization: Bearer <PAT>`, and body
+  `{"event_type": "qa-ticket", "client_payload": {"ticket": "{{issue.key}}"}}`.
+- **Schedule:** sweeps `jira.ready_jql` every two hours on weekdays.
+- **Manual:** Actions → jira-to-copilot → Run workflow.
+
+Secrets: `JIRA_EMAIL`, `JIRA_API_TOKEN`, and `QA_BOT_TOKEN` (a user fine-grained PAT with Issues: write, which
+assigning Copilot requires). If assignment fails, the workflow warns, and you can assign Copilot to the issue by
+hand. The workflow skips tickets that already have an open "[QA] KEY" issue.
+
+## 4. Copilot code review
+
+Code review reads `.github/copilot-instructions.md` too, so every PR (from people or from Copilot) is reviewed
+against the same rules: no sleeps, no absolute XPath, no weakened assertions, and steps reused rather than
+duplicated.

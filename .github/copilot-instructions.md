@@ -1,9 +1,9 @@
 # Repository instructions
 
-This repository holds mobile acceptance tests and the AI harness that writes and maintains them.
+This repository holds mobile acceptance tests and the QA toolbox that GitHub Copilot uses to write, run, and maintain them.
 
 - `mobile-tests/` is a Maven project: **Appium Java client 9 + TestNG + Cucumber 7**, run on **Sauce Labs real devices**. Java 17.
-- `src/qa_harness/` is the Python harness that automates the Jira → tests → Sauce Labs → pull request flow. Its agents follow the same instructions as Copilot, so keep these files accurate.
+- `src/qa_harness/` is the `qa-harness` MCP server, with tools for Jira, compile and dry-run, Sauce Labs runs, failure evidence, bug filing, Jira reporting, and the PR. It contains no LLM, because Copilot is the agent. The end-to-end workflow is in `.github/agents/qa-engineer.agent.md`.
 
 ## Architecture of the test project
 - `com.qa.mobile.support.TestContext` is per-scenario state injected by cucumber-picocontainer. Get the driver with `ctx.driver()`. The Appium session starts lazily on first use and is quit by `Hooks`.
@@ -21,5 +21,6 @@ This repository holds mobile acceptance tests and the AI harness that writes and
 - Build files (`pom.xml`) change only with a human decision.
 
 ## Verifying changes
-- Compile and bind steps without a device: `mvn -q test-compile surefire:test -Dcucumber.execution.dry-run=true` (in `mobile-tests/`), or the `discover_scenarios` tool of the `qa-harness` MCP server.
-- Run on Sauce Labs with the `run_on_sauce` MCP tool, or `qa-harness run <JIRA-KEY>` for the full autonomous flow.
+- Compile and bind steps without a device: the `discover_scenarios` MCP tool, or `mvn -q test-compile surefire:test -Dcucumber.execution.dry-run=true` in `mobile-tests/`.
+- Run on real devices: the `run_on_sauce` MCP tool, then `get_failure_evidence` for each failure.
+- Never claim a scenario passes without a `run_on_sauce` result showing it.

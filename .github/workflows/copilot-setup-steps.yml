@@ -27,8 +27,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install qa-harness with the MCP server
-        run: pip install -e '.[mcp]'
+      - name: Install qa-harness (MCP server)
+        run: pip install -e .
       - name: Pre-fetch Maven dependencies and compile
         working-directory: mobile-tests
         run: mvn -B -q test-compile

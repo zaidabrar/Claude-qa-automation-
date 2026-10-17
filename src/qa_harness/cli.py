@@ -1,238 +1,74 @@
-"""qa-harness command line.
+"""qa-harness command line. The same operations GitHub Copilot calls through MCP, for humans and CI.
 
-qa-harness run APP-123                 # full pipeline for one ticket
-qa-harness run APP-123 --mode dry_run  # everything local; no Jira/GitHub writes
-qa-harness watch                       # autonomous: poll Jira for ready tickets forever
-qa-harness resume APP-123-20261016T...  # continue a crashed / budget-stopped run
-qa-harness plan APP-123                # print the test plan only
-qa-harness doctor                      # verify configuration and credentials
-qa-harness mcp                         # MCP server for GitHub Copilot agent mode
+qa-harness mcp                                  # MCP server for Copilot (see .vscode/mcp.json)
+qa-harness doctor                               # check config, credentials, JDK/Maven, connectivity
+qa-harness ready                                # Jira tickets waiting for QA automation
+qa-harness ticket APP-123                       # print a ticket as markdown
+qa-harness discover [feature ...]               # compile + Cucumber dry run
+qa-harness run APP-123 -s <feature:line> ...    # run scenarios on Sauce Labs  [--device X] [--run-id R]
+qa-harness evidence RUN_ID SCENARIO DEVICE      # triage evidence for one failure
+qa-harness report RUN_ID|APP-123                # markdown report (PR description)
+qa-harness publish RUN_ID                       # report to Jira (comment, transition, label)
+qa-harness pr RUN_ID                            # commit tests, push, open draft PR
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import logging
-import re
+import os
 import shutil
 import sys
-import time
-from pathlib import Path
 
-from .config import AutonomyMode, Secrets, Settings, load_settings
-from .framework import CucumberMaven
-from .integrations.github import Git, GitHubClient
+from . import ops
+from .config import AutonomyMode, Settings, load_settings
 from .integrations.jira import JiraClient
-from .integrations.saucelabs import SauceClient
-from .llm import LLM
-from .models import Ticket
-from .pipeline import Deps, Pipeline, new_state
-from .stages.executor import SauceExecutor
-from .stages.reporter import render_report
-from .state import Guard, RunState, RunStore
-
-log = logging.getLogger("qa_harness")
-
-EXIT = {"passed": 0, "product_bug": 2, "needs_human": 3, "failed": 4, "error": 1}
+from .services import Services
+from .state import RunStore
 
 
-def build_framework(settings: Settings) -> CucumberMaven:
-    return CucumberMaven(
-        settings.tests_root, settings.repo_root, settings.project.maven_cmd, settings.project.maven_args
-    )
-
-
-def build_deps(settings: Settings, ticket_file: str | None = None) -> Deps:
-    secrets = Secrets.from_env(settings.notify)
-    jira = None
-    if settings.jira.base_url and secrets.jira_email and secrets.jira_token:
-        jira = JiraClient(settings.jira, secrets.jira_email, secrets.jira_token)
-    sauce = None
-    if secrets.sauce_username and secrets.sauce_access_key:
-        sauce = SauceClient(settings.sauce, secrets.sauce_username, secrets.sauce_access_key)
-
-    git = Git(settings.repo_root) if (settings.repo_root / ".git").exists() else None
-    github = None
-    if git and secrets.github_token:
-        repo = settings.github.repo or git.remote_repo()
-        if repo:
-            github = GitHubClient(settings.github, secrets.github_token, repo)
-
-    if ticket_file:
-        data = json.loads(Path(ticket_file).read_text())
-
-        def load_ticket(_key: str) -> Ticket:
-            return Ticket.model_validate(data)
-    elif jira:
-        load_ticket = jira.get_ticket
-    else:
-        raise SystemExit("Jira is not configured (jira.base_url, JIRA_EMAIL, JIRA_API_TOKEN); pass --ticket-file")
-
-    framework = build_framework(settings)
-    executor = SauceExecutor(settings, secrets, sauce, framework, settings.runs_root / "_artifacts")
-    return Deps(
-        settings=settings,
-        secrets=secrets,
-        llm=LLM(settings.llm),
-        framework=framework,
-        executor=executor,
-        load_ticket=load_ticket,
-        jira=jira,
-        git=git,
-        github=github,
-    )
-
-
-def _run_one(settings: Settings, key: str, ticket_file: str | None) -> RunState:
-    deps = build_deps(settings, ticket_file)
-    state = new_state(key)
-    store = RunStore(settings.runs_root, state.run_id)
-    deps.executor.artifacts_root = store.artifacts
-    print(f"▶ {key}: run {state.run_id} ({settings.autonomy.mode.value}) → {store.dir}", file=sys.stderr)
-    return Pipeline(deps, store, state, Guard(settings.autonomy.mode, store)).run()
-
-
-def cmd_run(args, settings: Settings) -> int:
-    try:
-        state = _run_one(settings, args.ticket, args.ticket_file)
-    except Exception as exc:
-        print(f"✖ {args.ticket}: {exc}", file=sys.stderr)
-        return EXIT["error"]
-    print(render_report(state))
-    return EXIT.get(state.status, 1)
-
-
-def cmd_resume(args, settings: Settings) -> int:
-    store = RunStore(settings.runs_root, args.run_id)
-    state = store.load()
-    if state.status == "error":
-        state.status, state.error = "running", None
-    deps = build_deps(settings, args.ticket_file)
-    deps.executor.artifacts_root = store.artifacts
-    state = Pipeline(deps, store, state, Guard(settings.autonomy.mode, store)).run()
-    print(render_report(state))
-    return EXIT.get(state.status, 1)
-
-
-def cmd_plan(args, settings: Settings) -> int:
-    from .stages.planner import build_plan
-
-    deps = build_deps(settings, args.ticket_file)
-    plan = build_plan(deps.llm, deps.load_ticket(args.ticket), settings)
-    print(plan.model_dump_json(indent=2) if args.json else _plan_markdown(plan))
-    print(f"\n(cost ${deps.llm.cost.spent_usd:.3f})", file=sys.stderr)
-    return 0
-
-
-def _plan_markdown(plan) -> str:
-    out = [f"# Test plan: {plan.ticket_key}", plan.feature_summary, "", "## Risks", *[f"- {r}" for r in plan.risks]]
-    for c in plan.test_cases:
-        out += ["", f"## {c.id} {c.title}  [{c.kind.value}, P{c.priority}, {'/'.join(p.value for p in c.platforms)}]"]
-        out += [f"Pre: {p}" for p in c.preconditions]
-        out += [f"{i}. {s.action} → {s.expected}" for i, s in enumerate(c.steps, 1)]
-        if not c.automatable:
-            out.append(f"_Manual: {c.automation_notes}_")
-    if plan.ambiguities:
-        out += ["", "## Ambiguities", *[f"- {a}" for a in plan.ambiguities]]
-    return "\n".join(out)
-
-
-def cmd_report(args, settings: Settings) -> int:
-    print(render_report(RunStore(settings.runs_root, args.run_id).load()))
-    return 0
-
-
-def _exclude_done(jql: str, label: str) -> str:
-    parts = re.split(r"\s+ORDER\s+BY\s+", jql, maxsplit=1, flags=re.I)
-    where = f'({parts[0]}) AND (labels IS EMPTY OR labels != "{label}")'
-    return where + (f" ORDER BY {parts[1]}" if len(parts) > 1 else "")
-
-
-def cmd_watch(args, settings: Settings) -> int:
-    deps = build_deps(settings)
-    if not deps.jira:
-        raise SystemExit("watch requires Jira credentials")
-    seen_path = settings.runs_root / "processed.json"
-    seen: set[str] = set(json.loads(seen_path.read_text())) if seen_path.exists() else set()
-    jql = _exclude_done(settings.jira.ready_jql, settings.jira.done_label)
-    print(f"Watching Jira every {args.interval}s: {jql}", file=sys.stderr)
-    while True:
-        try:
-            keys = [k for k in deps.jira.search_keys(jql, limit=args.batch) if k not in seen]
-        except Exception as exc:
-            log.error("Jira poll failed: %s", exc)
-            keys = []
-        for key in keys:
-            try:
-                state = _run_one(settings, key, None)
-                print(f"✔ {key}: {state.status} {state.pr_url or ''}", file=sys.stderr)
-            except Exception as exc:  # one bad ticket must not stop the daemon
-                print(f"✖ {key}: {exc}", file=sys.stderr)
-            seen.add(key)
-            seen_path.parent.mkdir(parents=True, exist_ok=True)
-            seen_path.write_text(json.dumps(sorted(seen)))
-        if args.once:
-            return 0
-        time.sleep(args.interval)
+def _resolve_run(settings: Settings, ref: str) -> str:
+    if (settings.runs_root / ref / "run.json").exists():
+        return ref
+    latest = RunStore.latest_id(settings.runs_root, ref)
+    if not latest:
+        raise SystemExit(f"No run {ref!r}")
+    return latest
 
 
 def cmd_doctor(args, settings: Settings) -> int:
-    secrets = Secrets.from_env(settings.notify)
+    svc = Services.from_settings(settings)
+    s = svc.secrets
     ok = True
 
-    def check(name: str, passed: bool, hint: str = "") -> None:
+    def check(name: str, passed: bool, hint: str = "", required: bool = True) -> None:
         nonlocal ok
-        ok &= passed
-        print(f"{'✔' if passed else '✖'} {name}" + ("" if passed else f"  — {hint}"))
+        ok &= passed or not required
+        mark = "✔" if passed else ("✖" if required else "–")
+        print(f"{mark} {name}" + ("" if passed else f"  — {hint}"))
 
-    import os
-
-    check(
-        "Anthropic credentials",
-        bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")),
-        "set ANTHROPIC_API_KEY (or log in with `ant auth login`)",
-    )
-    check(
-        "Jira config",
-        bool(settings.jira.base_url and secrets.jira_email and secrets.jira_token),
-        "jira.base_url + JIRA_EMAIL + JIRA_API_TOKEN",
-    )
-    check(
-        "Sauce Labs credentials",
-        bool(secrets.sauce_username and secrets.sauce_access_key),
-        "SAUCE_USERNAME + SAUCE_ACCESS_KEY",
-    )
-    check("Device matrix", bool(settings.sauce.devices), "add sauce.devices to qa_harness.yaml")
-    check(
-        "App under test",
-        bool(settings.sauce.android_app or settings.sauce.ios_app),
-        "set sauce.android_app and/or sauce.ios_app",
-    )
-    check("GitHub token", bool(secrets.github_token), "GITHUB_TOKEN (contents + pull_requests write)")
     check("Test project", (settings.tests_root / "pom.xml").is_file(), f"no pom.xml in {settings.tests_root}")
-    check("Maven", shutil.which(settings.project.maven_cmd) is not None, "install Maven 3.9+ and a JDK 17+")
+    check("Maven", shutil.which(settings.project.maven_cmd) is not None, "install Maven 3.9+")
     check("JDK", shutil.which("java") is not None, "install a JDK 17+")
-    check("Git repository", (settings.repo_root / ".git").exists(), "repo_root is not a git checkout")
+    check("Device matrix", bool(settings.sauce.devices), "add sauce.devices to qa_harness.yaml")
+    check("App under test", bool(settings.sauce.android_app or settings.sauce.ios_app), "set sauce.*_app")
+    check("Sauce Labs credentials", bool(s.sauce_username and s.sauce_access_key), "SAUCE_USERNAME + SAUCE_ACCESS_KEY")
+    check("Jira", svc.jira is not None, "jira.base_url + JIRA_EMAIL + JIRA_API_TOKEN")
+    check("Git repository", svc.git is not None, "repo_root is not a git checkout")
+    check("GitHub token (optional)", bool(s.github_token), "without it, open_pull_request returns a link", False)
 
-    if settings.jira.base_url and secrets.jira_email and secrets.jira_token:
+    if svc.jira:
         try:
-            JiraClient(settings.jira, secrets.jira_email, secrets.jira_token)._req("GET", "/myself")
+            JiraClient(settings.jira, s.jira_email, s.jira_token)._req("GET", "/myself")
             check("Jira reachable", True)
         except Exception as exc:
             check("Jira reachable", False, str(exc)[:200])
-    if secrets.sauce_username and secrets.sauce_access_key:
+    if svc.sauce:
         try:
-            r = SauceClient(settings.sauce, secrets.sauce_username, secrets.sauce_access_key).http.get(
-                "/v1/storage/files", params={"per_page": 1}
-            )
+            r = svc.sauce.http.get("/v1/storage/files", params={"per_page": 1})
             check("Sauce Labs reachable", r.status_code == 200, f"HTTP {r.status_code}")
         except Exception as exc:
             check("Sauce Labs reachable", False, str(exc)[:200])
-    print(
-        f"\nAutonomy mode: {settings.autonomy.mode.value} · model {settings.llm.model} "
-        f"(effort {settings.llm.effort}) · budget ${settings.llm.max_usd_per_run}/run"
-    )
+    print(f"\nMode: {settings.autonomy.mode.value}. No LLM key needed: GitHub Copilot is the agent.")
     return 0 if ok else 1
 
 
@@ -243,53 +79,79 @@ def cmd_mcp(args, settings: Settings) -> int:
     return 0
 
 
+def _print(text: str) -> int:
+    print(text)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="qa-harness", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--config", help="path to qa_harness.yaml")
     p.add_argument("--mode", choices=[m.value for m in AutonomyMode], help="override autonomy.mode")
-    p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    r = sub.add_parser("run", help="run the full pipeline for one ticket")
-    r.add_argument("ticket")
-    r.add_argument("--ticket-file", help="load the ticket from JSON instead of Jira")
-    r.set_defaults(fn=cmd_run)
+    sub.add_parser("mcp", help="serve the QA tools over MCP (stdio) for GitHub Copilot").set_defaults(fn=cmd_mcp)
+    sub.add_parser("doctor", help="check configuration and connectivity").set_defaults(fn=cmd_doctor)
 
-    rs = sub.add_parser("resume", help="resume a previous run from its checkpoint")
-    rs.add_argument("run_id")
-    rs.add_argument("--ticket-file")
-    rs.set_defaults(fn=cmd_resume)
+    r = sub.add_parser("ready", help="Jira tickets waiting for QA automation")
+    r.add_argument("--limit", type=int, default=20)
+    r.set_defaults(fn=lambda a, s: _print(ops.ready_tickets(Services.from_settings(s), a.limit)))
 
-    pl = sub.add_parser("plan", help="generate and print the test plan only")
-    pl.add_argument("ticket")
-    pl.add_argument("--ticket-file")
-    pl.add_argument("--json", action="store_true")
-    pl.set_defaults(fn=cmd_plan)
+    t = sub.add_parser("ticket", help="print a Jira ticket as markdown")
+    t.add_argument("key")
+    t.set_defaults(fn=lambda a, s: _print(ops.get_ticket(Services.from_settings(s), a.key)))
 
-    rp = sub.add_parser("report", help="print the report for a run")
-    rp.add_argument("run_id")
-    rp.set_defaults(fn=cmd_report)
+    d = sub.add_parser("discover", help="compile + Cucumber dry run")
+    d.add_argument("features", nargs="*")
+    d.set_defaults(fn=lambda a, s: _print(ops.discover(Services.from_settings(s), a.features)))
 
-    w = sub.add_parser("watch", help="poll Jira and process ready tickets autonomously")
-    w.add_argument("--interval", type=int, default=300)
-    w.add_argument("--batch", type=int, default=5)
-    w.add_argument("--once", action="store_true", help="process one poll then exit (for cron/CI)")
-    w.set_defaults(fn=cmd_watch)
+    run = sub.add_parser("run", help="run scenarios on Sauce Labs")
+    run.add_argument("ticket")
+    run.add_argument("-s", "--scenario", action="append", required=True, help="feature:line (repeatable)")
+    run.add_argument("--device", action="append", help="device name (repeatable; default all)")
+    run.add_argument("--run-id", help="add an attempt to an existing run")
 
-    d = sub.add_parser("doctor", help="check configuration and connectivity")
-    d.set_defaults(fn=cmd_doctor)
+    def cmd_run(a, s):
+        qa_run, text = ops.run_scenarios(Services.from_settings(s), a.ticket, a.scenario, a.device, a.run_id)
+        print(text)
+        return 0 if qa_run.status() == "passed" else 2
 
-    m = sub.add_parser("mcp", help="serve harness tools over MCP (stdio) for GitHub Copilot agent mode")
-    m.set_defaults(fn=cmd_mcp)
+    run.set_defaults(fn=cmd_run)
+
+    e = sub.add_parser("evidence", help="triage evidence for one failure")
+    e.add_argument("run_id")
+    e.add_argument("scenario")
+    e.add_argument("device")
+    e.set_defaults(
+        fn=lambda a, s: _print(ops.failure_evidence(Services.from_settings(s), a.run_id, a.scenario, a.device))
+    )
+
+    rp = sub.add_parser("report", help="markdown report for a run id or ticket key")
+    rp.add_argument("ref")
+    rp.set_defaults(fn=lambda a, s: _print(ops.pr_description(Services.from_settings(s), _resolve_run(s, a.ref))))
+
+    pb = sub.add_parser("publish", help="report a run to Jira")
+    pb.add_argument("ref")
+    pb.set_defaults(fn=lambda a, s: _print(ops.publish_to_jira(Services.from_settings(s), _resolve_run(s, a.ref))))
+
+    pr = sub.add_parser("pr", help="commit test changes, push, open a draft PR")
+    pr.add_argument("ref")
+    pr.add_argument("--title")
+    pr.set_defaults(
+        fn=lambda a, s: _print(ops.open_pull_request(Services.from_settings(s), _resolve_run(s, a.ref), a.title))
+    )
 
     args = p.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
-    settings = load_settings(args.config)
+    settings = load_settings(args.config or os.environ.get("QA_HARNESS_CONFIG"))
     if args.mode:
         settings.autonomy.mode = AutonomyMode(args.mode)
-    return args.fn(args, settings)
+    try:
+        return args.fn(args, settings)
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
